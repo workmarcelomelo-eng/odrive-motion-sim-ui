@@ -1,0 +1,52 @@
+/* ODrive Motion Setup — tema escuro, compacto para telas de bancada e pequenas (ESP32 webserver) */
+:root{
+  --bg:#101418; --panel:#181e26; --panel2:#1f2733; --line:#2b3646;
+  --txt:#dbe4f0; --muted:#8fa0b5; --accent:#2f9e6f; --accent2:#2f7fd6;
+  --warn:#e0a13a; --err:#d94f4f; --ok:#35b06f;
+}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.45 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
+header{display:flex;align-items:baseline;gap:16px;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:18px;margin:0}
+header .muted{margin-left:auto}
+#layout{display:grid;grid-template-columns:230px 1fr;min-height:calc(100vh - 53px)}
+nav#steps{border-right:1px solid var(--line);background:var(--panel);padding:12px}
+nav#steps .item{padding:9px 12px;margin:2px 0;border-radius:8px;color:var(--muted);cursor:pointer;display:flex;gap:8px;align-items:center}
+nav#steps .item .n{width:22px;height:22px;border-radius:50%;background:var(--panel2);color:var(--muted);display:grid;place-items:center;font-size:12px;flex:none}
+nav#steps .item.active{background:var(--panel2);color:var(--txt)}
+nav#steps .item.active .n{background:var(--accent2);color:#fff}
+nav#steps .item.done .n{background:var(--accent);color:#fff}
+main{padding:20px;max-width:980px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}
+.panel h2{margin:0 0 4px}
+.muted{color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:14px 0}
+.field{display:flex;flex-direction:column;gap:4px}
+.field label{font-size:12px;color:var(--muted)}
+.field input,.field select{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:8px 10px;font:inherit}
+.field input:read-only{opacity:.6}
+.btns{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+button{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:9px 16px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--accent2)}
+button.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
+button.primary:hover{filter:brightness(1.1)}
+button.danger{background:var(--err);border-color:var(--err);color:#fff}
+button.ok{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.45;cursor:not-allowed}
+.badge{border-radius:20px;padding:2px 10px;font-size:12px;background:var(--panel2);color:var(--muted)}
+.badge.on{background:var(--ok);color:#06210f}
+.badge.off{background:var(--panel2)}
+.badge.err{background:var(--err);color:#fff}
+.flex{flex:1}
+.log{background:#0b0e12;border:1px solid var(--line);border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,Consolas,monospace;max-height:220px;overflow:auto;white-space:pre-wrap}
+.kv{display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;font-size:14px}
+.kv b{font-weight:600}
+.notice{border-left:3px solid var(--warn);background:#1c1913;padding:10px 12px;border-radius:6px;margin:10px 0}
+.notice.err{border-color:var(--err);background:#221414}
+.notice.ok{border-color:var(--ok);background:#12201a}
+table.list{width:100%;border-collapse:collapse;margin:10px 0}
+table.list td,table.list th{border-bottom:1px solid var(--line);padding:8px;text-align:left;font-size:14px}
+canvas.plot{width:100%;height:220px;background:#0b0e12;border:1px solid var(--line);border-radius:8px}
+.big-gauge{font-size:34px;font-weight:700}
+.nav.btns{justify-content:space-between;margin-top:18px}
+@media (max-width:760px){#layout{grid-template-columns:1fr}nav#steps{display:none}}

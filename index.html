@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<!--
+  ODrive Motion Sim Setup — wizard de configuração para atuadores de fuso de esferas.
+  UI pura (zero build). A mesma pasta é servida direto pelo ESP32 (SPIFFS/LittleFS).
+  Transporte: abstração em app.js -> WebSocket (dev: bridge.py / ESP32: firmware nativo).
+-->
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ODrive Motion Setup</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>ODrive Motion Setup <span id="hdr-status" class="badge off">offline</span></h1>
+  <div id="hdr-device" class="muted">nenhum dispositivo</div>
+</header>
+
+<div id="layout">
+  <nav id="steps"></nav>
+  <main id="page"></main>
+</div>
+
+<template id="tpl-step">
+  <section class="panel">
+    <h2></h2>
+    <p class="muted desc"></p>
+    <div class="body"></div>
+    <div class="nav btns">
+      <button class="prev">← Voltar</button>
+      <span class="flex"></span>
+      <button class="next primary">Próximo →</button>
+    </div>
+  </section>
+</template>
+
+<script src="app.js"></script>
+<script src="steps.js"></script>
+</body>
+</html>
