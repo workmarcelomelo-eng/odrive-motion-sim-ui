@@ -127,8 +127,11 @@ class WebSerialTransport {
  *  - fallback para mock/bridge WS já em :8765 se navigator.serial não existir
  */
 function makeTransport() {
-  const isEsp32 = location.port === '' || location.port === '80';
-  if (isEsp32) return new WSTransport();
+  // ESP32 hospeda a UI pelo seu IP/mDNS: AP 192.168.4.1, STA em DHCP na sua rede, ou odrive-motorsim.local
+  const host = location.hostname;
+  const isEsp32 = (/^\d+\.\d+\.\d+\.\d+$/.test(host) && host !== '127.0.0.1') || host.endsWith('.local') || host === 'odrive-motorsim';
+  if (isEsp32) return new WSTransport(`ws://${host}:81/`);
+  // PC (GitHub Pages/localhost/dev): Web Serial direto à ODrive; fallback p/ mock WS em browser sem Web Serial
   if ('serial' in navigator) return new WebSerialTransport();
   return new WSTransport('ws://127.0.0.1:8765/');
 }
@@ -241,14 +244,46 @@ const STEPS = [];
   };
 
   STEPS.push({
-    id: 'link', title: '0. Conexão', desc: 'Conecta no bridge e seleciona o atuador (ODrive + eixo).',
+    id: 'link',
+    title: '0. Conexão',
+    desc: isEsp32
+      ? 'ESP32 como ponte: gerenciamento de até 6 eixos ODrive via CAN (IDs já gravados pelo setup no Windows).'
+      : 'Conexão serial direta à ODrive (USB/ASCII) — primeiro setup do atuador: parâmetros, homing e CAN ID.',
     body(b) {
-      bUse.onclick = () => {
-        S.dev = chosen.dev; S.axis = chosen.axis;
-        document.getElementById('hdr-device').textContent = `${S.dev} — eixo M${S.axis}`;
-        app.finish('link');
-      };
-      b.append(row(bConn, bScan), table, row(bUse));
+      if (isEsp32) {
+        // Modo ESP32: sem serial aqui — o link é WS (CAN por trás). Gerencia todos os eixos do rig.
+        bConn.textContent = 'Conectar à ponte ESP32';
+        const iNA = num(2, 1, 1);
+        const iAxis = sel([], 0);
+        const refreshAxes = n => {
+          iAxis.innerHTML = '';
+          for (let i = 0; i < n; i++) iAxis.append(new Option('Eixo ' + i + ' (CAN node ' + i + ')', i));
+          S.axesList = Array.from({ length: n }, (_, i) => i);
+        };
+        refreshAxes(2);
+        iNA.oninput = () => refreshAxes(Math.max(1, Math.min(6, +iNA.value || 2)));
+        iAxis.onchange = () => { S.axis = +iAxis.value; };
+        const bApplyAx = btn('Aplicar configuração do rig (qtd eixos)', 'primary');
+        bApplyAx.onclick = () => {
+          S.axesList = Array.from({ length: Math.max(1, Math.min(6, +iNA.value || 2)) }, (_, i) => i);
+          S.axis = +iAxis.value;
+          document.getElementById('hdr-device').textContent = `ESP32 — ${S.axesList.length} eixo(s), eixo atual ${S.axis}`;
+          app.finish('link');
+        };
+        b.append(note('No ESP32 o uso diário é via esta página. A conexão serial PC↔ODrive só faz sentido para gravar parâmetros/CAN IDs — faça isso pela UI no Windows.', 'info'),
+                 grid(field('QD de eixos do rig (1–6)', iNA), field('Eixo em foco', iAxis)),
+                 row(bConn),
+                 el('hr'),
+                 row(bApplyAx));
+      } else {
+        bConn.textContent = odrive instanceof WebSerialTransport ? 'Conectar ODrive (USB serial)' : 'Conectar bridge (dev)';
+        bUse.onclick = () => {
+          S.dev = chosen.dev; S.axis = chosen.axis;
+          document.getElementById('hdr-device').textContent = `${S.dev} — eixo M${S.axis}`;
+          app.finish('link');
+        };
+        b.append(row(bConn, bScan), table, row(bUse));
+      }
     },
   });
 }
