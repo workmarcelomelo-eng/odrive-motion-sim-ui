@@ -51,7 +51,88 @@ class WSTransport {
   subscribe(period) { return this.call('telemetry', { on: true, period_ms: period }); }
   unsubscribe()     { return this.call('telemetry', { on: false }); }
 }
-const odrive = new WSTransport();
+/* Transporte serial direto à ODrive (protocolo ASCII, ver docs/ascii-protocol.rst).
+ * No Windows: rookEdge/Chrome com Web Serial; abre o COM da ODrive (USB) ou um adaptador
+ * USB-TTL em GPIO1/GPIO2 (UART_A, 115200 8N1). Não requer bridge. */
+class WebSerialTransport {
+  constructor(baud = 115200) { this.baud = baud; this.q = Promise.resolve(); this.reader = null; this.onstate = null; this.onevent = null; this.teleTimer = null; this._pendingGet = null; this._buf = ''; }
+  connect() {
+    return new Promise(async (res, rej) => {
+      try {
+        if (!('serial' in navigator)) return rej(new Error('Web Serial não suportado neste browser — use Chrome/Edge'));
+        this.port = await navigator.serial.requestPort();
+        await this.port.open({ baudRate: this.baud, dataBits: 8, stopBits: 1, parity: 'none' });
+        this.td = new TextDecoderStream(); this.port.readable.pipeTo(this.td.writable).catch(() => {});
+        this.stream = this.td.readable; this.reader = this.stream.getReader();
+        this._readLoop();
+        res();
+      } catch (e) { rej(e); }
+    });
+  }
+  async _readLoop() {
+    try {
+      while (true) {
+        const { value, done } = await this.reader.read();
+        if (done) break;
+        this._buf += value;
+        let i;
+        while ((i = this._buf.indexOf('\n')) >= 0) {
+          const line = this._buf.slice(0, i).replace(/\r$/, '').trim();
+          this._buf = this._buf.slice(i + 1);
+          if (this._pendingGet) { const p = this._pendingGet; this._pendingGet = null; const f = parseFloat(line); p.res(isNaN(f) ? line : f); }
+        }
+      }
+    } catch (e) {} this._close();
+  }
+  _close() { onConn(false); this.onstate && this.onstate(false); }
+  get connected() { return !!(this.port && this.port.writable); }
+  _send(line) { if (!this.connected) return; const w = this.port.writable.getWriter(); const te = new TextEncoder(); w.write(te.encode(line + '\n')).finally(() => w.releaseLock()); }
+  // serialização de requisições (a ODrive processa uma linha por vez)
+  _q(fn) { const r = this.q.then(fn, fn); this.q = r.catch(() => {}); return r; }
+  get(path) {
+    if (!this.connected) return Promise.resolve(null);
+    return this._q(() => new Promise((res) => {
+      this._pendingGet = { res };
+      setTimeout(() => { if (this._pendingGet) { this._pendingGet = null; res(null); } }, 800);
+      this._send('r ' + path);
+    }));
+  }
+  set(path, value) { return this._q(async () => { this._send(`w ${path} ${value}`); await new Promise(r => setTimeout(r, 30)); }); }
+  reqState(s) { const axn = (typeof S !== 'undefined' ? S.axis : 0); return this.set(`axis${axn}.requested_state`, s); }
+  action(name) {
+    const m = { save: 'ss', erase: 'se', reboot: 'sr', clear: 'sc' };
+    return this._q(async () => { this._send(m[name] || name); await new Promise(r => setTimeout(r, 50)); });
+  }
+  scan() { return Promise.resolve([{ serial: 'USB-serial', hw_major: 3, hw_minor: 6, fw: '0.5.6-sh' }]); }
+  subscribe(period = 50) {
+    this.unsubscribe();
+    if (!this.connected) return Promise.resolve();
+    this.teleTimer = setInterval(async () => {
+      const pos = await this.get(`axis${S.axis}.encoder.pos_estimate`);
+      const iq  = await this.get(`axis${S.axis}.motor.Iq_measured`);
+      const tgt = await this.get(`axis${S.axis}.controller.pos_setpoint`);
+      const err = await this.get(`axis${S.axis}.error`);
+      const st  = await this.get(`axis${S.axis}.current_state`);
+      const vb  = await this.get(`vbus_voltage`);
+      this.onevent && this.onevent({ event: 'telemetry', pos, iq, tgt, error: err, state: st, vbus: vb });
+    }, period);
+    return Promise.resolve();
+  }
+  unsubscribe() { if (this.teleTimer) { clearInterval(this.teleTimer); this.teleTimer = null; } return Promise.resolve(); }
+}
+
+/* Escolha automática:
+ *  - página servida pelo ESP32 (porta 80)  -> WebSocket (CAN no outro lado)
+ *  - screen do browser local/dev          -> Web Serial direto à ODrive (Windows)
+ *  - fallback para mock/bridge WS já em :8765 se navigator.serial não existir
+ */
+function makeTransport() {
+  const isEsp32 = location.port === '' || location.port === '80';
+  if (isEsp32) return new WSTransport();
+  if ('serial' in navigator) return new WebSerialTransport();
+  return new WSTransport('ws://127.0.0.1:8765/');
+}
+const odrive = makeTransport();
 
 /* ===================== Estado global ===================== */
 const S = {
@@ -130,9 +211,12 @@ const STEPS = [];
   const bUse  = btn('Usar selecionado', 'ok');
   bUse.disabled = true;
 
+  const isEsp32 = odrive instanceof WSTransport && odrive.url && odrive.url.includes(':81');
+  const isSerial = odrive instanceof WebSerialTransport;
+  bConn.textContent = isSerial ? 'Conectar ODrive (USB serial)' : (isEsp32 ? 'Conectar à ponte ESP32 (CAN)' : 'Conectar bridge (dev)');
   bConn.onclick = async () => {
-    try { await odrive.connect(); onConn(true); log('bridge conectado em ' + odrive.url); }
-    catch { onConn(false); log('falha — rode python bridge.py no PC'); }
+    try { await odrive.connect(); onConn(true); log(isSerial ? 'serial conectada (115200 8N1)' : 'bridge/ponte conectada em ' + odrive.url); }
+    catch (e) { onConn(false); log('falha: ' + (e && e.message ? e.message : e)); }
   };
   bScan.onclick = async () => {
     bScan.disabled = true;
