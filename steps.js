@@ -70,6 +70,67 @@
     return n === 0 ? '0' : ('0x' + (n >>> 0).toString(16).toUpperCase());
   };
 
+  // ============ Decodificador de erros para o operador (pt-BR) ============
+  // Bitmasks do firmware v0.5.6 (ver tools/odrive/enums.py). Msg formatada "[bit flag] descrição — dica".
+  const ERR_AXIS = {
+    0x1:  ['INVALID_STATE', 'O eixo não está no estado que a operação exige — provavelmente falta calibração/encoder pronto. Complete Etapas 1–3.'],
+    0x40: ['MOTOR_FAILED', 'Falha geral do motor — ver motor.error para detalhe.'],
+    0x80: ['SENSORLESS_FAILED', 'Estimador sem sensor falhou — confira os parâmetros motor/encoder.'],
+    0x100:['ENCODER_FAILED', 'Falha no encoder — ver encoder.error.'],
+    0x200:['CONTROLLER_FAILED', 'Controlador falhou — ver controller.error.'],
+    0x800:['WATCHDOG', 'O watchdog expirou — a UI deixou de enviar comando por muito tempo (USB travou ou aba fechada).'],
+    0x1000:['MIN_ENDSTOP', 'Endstop mínimo acionado fora de homing — verifique fio/polaridade/GPIO.'],
+    0x2000:['MAX_ENDSTOP', 'Endstop máximo acionado fora de homing.'],
+    0x4000:['ESTOP_CAN', 'E-stop recebido por CAN — o rig paralisou por segurança.'],
+    0x20000:['HOMING_SEM_ENDSTOP', 'Homing requisitado mas nenhum endstop habilitado. Use modo stall-current ou ative GPIO na Etapa 3.'],
+    0x40000:['OVER_TEMP_ROM', 'Temperatura excedida — cheque dissipador/ventilação do driver.'],
+    0x80000:['POSICAO_INVALIDA', 'Posição do encoder inválida — encoder ainda não pronto ou CPR errado.'],
+    0x100000:['HOMING_STALL_NAO_DETECTADO', 'Homing por stall percorreu mais que o curso máx. sem travar — aumente corrente de stall / distância máx / verifique se o fuso trava de verdade no batente.'],
+  };
+  const ERR_MOTOR = {
+    0x1:  ['RESISTENCIA_FORA', 'Resistência de fase medida fora da faixa — verifique os fios do motor e os pole pairs.'],
+    0x2:  ['INDUTANCIA_FORA', 'Indutância fora da faixa — recalibre o motor.'],
+    0x8:  ['DRV8301_FAULT', 'Falha no driver de potência (DRV8301) — pode indicar curto/resfriamento/alimentação.'],
+    0x10: ['DEADLINE_MISSED', 'Controle perdeu o deadline do PWM — reinicie e diminua carga.'],
+    0x80: ['MODULACAO_SAT', 'Modulação saturada — tensão de bus/motor incompatível, suba fonte ou revise vel_limit.'],
+    0x400:['CORRENTE_SATURADA', 'Sensor de corrente saturado — corrente passou do que o shunt mede; aceite menos corrente_lim.'],
+    0x1000:['LIMITE_CORRENTE', 'Motor passou de current_lim em operação normal — aumente a margem ou restrinja velocidade.'],
+    0x10000:['MODULACAO_NAN', 'NaN na modulação de fase — falha de software/encoder; reinicie.'],
+    0x20000:['TERM_MOTOR_QUENTE', 'Sensor de temperatura do motor excedeu limite.'],
+    0x40000:['TERM_FET_QUENTE', 'FETs da ODrive em sobretemperatura — ventile a placa.'],
+    0x80000:['TIMER_UPDATE_MISSED', 'Timer do MCU perdeu ciclo — raro; reboot.'],
+    0x100000:['CORRENTE_INVALIDA', 'Leitura de corrente indisponível — problema no ADC/offset.'],
+    0x200000:['CONTROLLER_CORRENTE', 'Controlador de corrente/FOC in coerente — recalibre o motor.'],
+    0x800000:['RESISTOR_FREIO', 'Resistor de dissipação desarmado — corrente de regeneração perigosa.'],
+  };
+  const ERR_ENCODER = {
+    0x1:  ['GANHO_INSTAVEL', 'Ganho de PLL do encoder instável — recalibre o encoder.'],
+    0x2:  ['CPR_INCON.VALE', 'CPR do encoder não bate com pole pairs — corrija pole pairs ou cpr.'],
+    0x4:  ['SEM_RESPOSTA', 'Encoder não responde — fio/sinal.'],
+    0x8:  ['MODO_NAO_SUPORTADO', 'Modo de encoder não suportado neste hardware.'],
+    0x10: ['HALL_INVALIDO', 'Estado de Hall ilegal — encoder Hall com problema.'],
+    0x20: ['SEM_INDEX_AINDA', 'Busca de index ainda não achou — gire 1 completa ou revise canal Z.'],
+    0x40: ['SPI_TIMEOUT', 'Encoder SPI absoluto: timeout.'],
+    0x80: ['SPI_COM', 'Encoder SPI absoluto: falha de comunicação.'],
+    0x100:['SPI_NAO_PRONTO', 'Encoder SPI absoluto não está pronto.'],
+    0x200:['HALL_NAO_CALIBRADO', 'Encoder Hall não calibrado ainda.'],
+  };
+
+  const decErr = (kind, v) => {
+    const n = parseInt(v) || 0;
+    if (!n) return 'sem erros';
+    const table = kind === 'motor' ? ERR_MOTOR : kind === 'encoder' ? ERR_ENCODER : ERR_AXIS;
+    const parts = [];
+    for (const bit of Object.keys(table).map(Number)) {
+      if (n & bit) parts.push(`<b>[${table[bit][0]}]</b> ${table[bit][1]}`);
+    }
+    const desconhecidos = n & ~Object.keys(table).map(Number).reduce((a, b) => a | b, 0);
+    if (desconhecidos) parts.push('<b>[?]</b> flags desconhecidas ' + hexErr(desconhecidos));
+    return parts.length ? parts.join('<br>') : ('erro ' + hexErr(n));
+  };
+
+  // uso: decErr('axis'|'motor'|'encoder', valorLido) — texto já formatado em HTML compacto
+
   // Espera até que getA(path) satisfaça pred, com timeout.
   function pollUntil(path, pred, timeoutMs = 30000, periodMs = 300) {
     return new Promise((resolve, reject) => {
@@ -138,7 +199,7 @@
             const axErr = await getA('error');
             const moErr = await getA('motor.error');
             if ((parseInt(axErr) || 0) !== 0 || (parseInt(moErr) || 0) !== 0) {
-              throw new Error('falha na calibração do motor — axis.error=' + hexErr(axErr) + ' motor.error=' + hexErr(moErr));
+              throw new Error('Falha na calibração do motor:<br>' + decErr('axis', axErr) + (moErr ? '<br>' + decErr('motor', moErr) : ''));
             }
             const R = await getA('motor.config.phase_resistance');
             const L = await getA('motor.config.phase_inductance');
@@ -341,7 +402,7 @@
             await pollUntil('current_state', s => parseInt(s) === 1, 60000, 400);
             const axErr = await getA('error');
             const homed = await getA('is_homed');
-            if ((parseInt(axErr) || 1) !== 0) throw new Error('axis.error=' + hexErr(axErr));
+            if ((parseInt(axErr) || 1) !== 0) throw new Error('Falha no homing:<br>' + decErr('axis', axErr));
             if (parseInt(homed) !== 1) throw new Error('eixo não reportou is_homed=1');
             S.stepOk.homing = true; S.done.add(id);
             noteEl.className = 'notice ok';
@@ -370,7 +431,7 @@
             } else {
               S.stepOk.homing = false; S.done.delete(id);
               noteEl.className = 'notice warn';
-              noteEl.textContent = 'Verificação FALHOU: homing_mode=' + hm + ', is_homed=' + homed + ', error=' + hexErr(axErr) + '.';
+              noteEl.innerHTML = 'Verificação FALHOU:<br>modo=' + hm + ' is_homed=' + homed + '<br>erro: ' + decErr('axis', axErr);
             }
           } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
         };
@@ -450,7 +511,7 @@
               noteEl.className = 'notice ok';
               noteEl.textContent = 'Malha fechada ativa (state=8, error=0). O motor vai segurar posição — não force o eixo.';
             } else {
-              throw new Error('state=' + st + ', error=' + hexErr(axErr));
+              throw new Error('Malha fechada falhou (state=' + st + '):<br>' + decErr('axis', axErr));
             }
           } catch (e) { log('closed-loop falhou: ' + e.message); noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao entrar em malha fechada: ' + e.message; }
         };
@@ -569,7 +630,7 @@
           try {
             await odrive.reqState(1); // IDLE — para tudo
             const axErr = await getA('error');
-            log('STOP acionado (state=1, error=' + hexErr(axErr) + ')');
+            log('STOP acionado (state=1): ' + decErr('axis', axErr));
             noteEl.className = 'notice warn';
             noteEl.textContent = 'STOP: eixo em IDLE. Malha fechada desligada.';
           } catch (e) { log('stop falhou: ' + e.message); }
@@ -588,7 +649,7 @@
             } else {
               S.stepOk.motiontest = false;
               noteEl.className = 'notice warn';
-              noteEl.textContent = 'Verificação FALHOU: state=' + st + ' (esperado 8), error=' + hexErr(axErr) + '. Faça um jog antes de verificar.';
+              noteEl.innerHTML = 'Verificação FALHOU: state=' + st + ' (esperado 8)<br>erro: ' + decErr('axis', axErr) + '. Faça um jog antes de verificar.';
             }
           } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
         };
@@ -733,7 +794,7 @@
             tr.cells[2].textContent = vel === null ? '—' : fmt(turn2mm(vel), 1);
             tr.cells[3].textContent = iq === null ? '—' : fmt(iq, 2);
             tr.cells[4].textContent = st === null ? '—' : String(st);
-            tr.cells[5].textContent = hexErr(err);
+            tr.cells[5].innerHTML = decErr('axis', err);
             tr.cells[5].className = (parseInt(err) || 0) !== 0 ? 'err' : '';
             tr.cells[6].textContent = vb === null ? '—' : fmt(vb, 1);
           } catch (e) {
@@ -781,7 +842,7 @@
                 await odrive.reqState(6);
                 await pollUntil('current_state', s => parseInt(s) === 1, 60000, 400);
                 const err = await getA('error');
-                log('monitor: M' + a + ' homing fim, error=' + hexErr(err));
+                log('monitor: M' + a + ' fim de homing — ' + decErr('axis', err));
               } catch (e) { log('homing M' + a + ' falhou: ' + e.message); }
             }
           } finally { S.axis = prev; }
