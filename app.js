@@ -282,7 +282,25 @@ const STEPS = [];
           document.getElementById('hdr-device').textContent = `${S.dev} — eixo M${S.axis}`;
           app.finish('link');
         };
-        b.append(row(bConn, bScan), table, row(bUse));
+
+        // Apagar toda a configuração da ODrive (começar do zero)
+        const bWipe = btn('⚠ Apagar toda a configuração (erase)', 'danger');
+        bWipe.onclick = async () => {
+          if (!odrive.connected) { log('Conecte à ODrive antes de apagar.' , 'warn'); return; }
+          if (!confirm('Isso APAGA permanentemente toda a configuração gravada na flash da ODrive (motor, encoder, homing, CAN). A placa vai reiniciar de fábrica. Continuar?')) return;
+          if (!confirm('Confirma novamente: ERASE CONFIGURATION + REBOOT?')) return;
+          try {
+            bWipe.disabled = true;
+            await odrive.action('erase');   // se — erase config
+            await odrive.action('reboot');  // sr — reinicia a placa
+            log('Configuração apagada. Aguarde o boot (~2s) e Clique novamente em "Conectar ODrive" para recomeçar do zero.');
+            onConn(false); odrive.onstate && odrive.onstate(false);
+            S.done.delete('link'); app.render();
+          } catch (e) { log('Falha ao apagar: ' + e.message); }
+          bWipe.disabled = false;
+        };
+        b.append(row(bConn, bScan), table, row(bUse), el('hr'), row(bWipe),
+          note('O botão de apagar só serve se houver configuração antiga travada — use com cautela.', 'warn'));
       }
     },
   });
