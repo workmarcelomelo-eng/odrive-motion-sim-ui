@@ -1,666 +1,799 @@
 /*
- * ODrive Motion Setup — etapas do wizard (registradas em window.STEPS).
- * Depende de window._core exportado por app.js (helpers DOM, S, odrive, setA/getA…).
+ * ODrive Motion Setup — etapas 1..7 do wizard (a etapa 0, Conexão, vive em app.js).
+ * Depende de window._core exportado por app.js:
+ *   { S, el, field, num, sel, btn, grid, row, note, log, odrive,
+ *     axP, setA, getA, mm2turn, turn2mm, fmt, drawPlot, app }
  *
- * Protocolo (mesmo para WSTransport e WebSerialTransport):
- *   odrive.get('axis0.motor.config.pole_pairs') / odrive.set(path, value)
- *   odrive.reqState(n) — AXIS_STATE_*: 1 IDLE, 4 MOTOR_CALIBRATION, 5 ENCODER_INDEX_SEARCH,
- *                        6 HOMING (fw custom), 8 CLOSED_LOOP_CONTROL
+ * Contrato rígido (etapas 1..6):
+ *   - Botões separados "Aplicar" (grava config) e "Verificar" (relê e valida).
+ *   - Avanço só com S.stepOk[id] === true, setado por verificação bem-sucedida.
  *
- * Passos implementados aqui:
- *   1. Motor        — tipo, pole_pairs, R/L + botão "Medir R & L"
- *   2. Atuador      — fuso de esferas: pitch e curso
- *   3. Calibração   — endstop (fim de curso) ou stall-current (batente)
- *   4. Tuning       — pos/vel/vel_integrator gains + presets + entrada em closed-loop (8)
- *
- * Nota: requested_state 7 não existe no firmware ODrive padrão (é reservado);
- * closed-loop é 8 (AXIS_STATE_CLOSED_LOOP_CONTROL). O passo de tuning oferece
- * botões para IDLE(1), calibração de encoder(5), homing(6) e closed-loop(8).
+ * Nota sobre protocolo ASCII (transporte serial): odrive.reqState(n) escreve
+ *   `w axisN.requested_state n` na linha serial. Erros de leitura da ODrive
+ *   (axis.error / motor.error) são flags físicas — exibidas decodificadas em hex.
  */
 'use strict';
 
 (function () {
-  const { S, el, field, num, sel, btn, grid, row, note, log, odrive, axP, setA, getA, mm2turn, turn2mm, fmt, drawPlot, app } = window._core;
+  const { S, el, field, num, sel, btn, grid, row, note, log,
+          odrive, setA, getA, mm2turn, turn2mm, fmt, drawPlot, app } = window._core;
   const STEPS = window.STEPS;
 
-  // IDs de estado do eixo (firmware 0.5.x)
-  const AXIS = { IDLE: 1, MOTOR_CALIB: 4, ENCODER_INDEX: 5, HOMING: 6, CLOSED_LOOP: 8 };
-  const MOTOR_TYPES = [[0, 'Motor grande / alto torque (MOTOR_TYPE_HIGH_CURRENT)'], [2, 'Gimbal (MOTOR_TYPE_GIMBAL)']];
+  // Estado de validação por etapa: avanço só ocorre quando S.stepOk[id] === true.
+  if (!S.stepOk) S.stepOk = {};
 
-  const statusLine = () => { const n = note('', 'info'); n.id = 'step-status'; return n; };
-  const setStatus = (txt, kind = 'info') => {
-    const n = document.getElementById('step-status');
-    if (n) { n.className = 'notice ' + kind; n.textContent = txt; }
-    log(txt);
+  // Aviso exibido quando o "Próximo →" é bloqueado.
+  function blockedWarn(bodyEl, id) {
+    const old = bodyEl.querySelector('.notice.warn.gate');
+    if (old) old.remove();
+    const n = note('⚠ Etapa "' + id + '" ainda não verificada — aplique os parâmetros e clique em "Verificar" antes de avançar.', 'warn gate');
+    bodyEl.insertBefore(n, bodyEl.firstChild);
+    setTimeout(() => n.remove(), 5000);
+  }
+
+  // Gate global do botão "Próximo →" (app.finish) respeitando canFinish().
+  if (!app.__gated) {
+    const origFinish = app.finish.bind(app);
+    app.finish = function (id) {
+      const st = STEPS.find(s => s.id === id);
+      if (st && typeof st.canFinish === 'function' && st.canFinish() !== true) {
+        const bodyEl = document.querySelector('#page .body');
+        if (bodyEl) blockedWarn(bodyEl, st.title);
+        log('Etapa bloqueada: verificação pendente (' + id + ')');
+        return;
+      }
+      origFinish(id);
+    };
+    app.__gated = true;
+
+    // Garante que onLeave() do passo atual seja chamado ao trocar de etapa.
+    const origGoto = app.goto.bind(app);
+    app.goto = function (i) {
+      const cur = STEPS[app.cur];
+      if (cur && typeof cur.onLeave === 'function') {
+        try { cur.onLeave(); } catch (e) { /* ignora */ }
+      }
+      origGoto(i);
+    };
+  }
+
+  // Diferença tolerante para comparar floats relidos da ODrive.
+  const eq = (a, b, tol = 1e-4) => {
+    const na = parseFloat(a), nb = parseFloat(b);
+    if (isNaN(na) || isNaN(nb)) return String(a) === String(b);
+    return Math.abs(na - nb) <= Math.max(tol, Math.abs(nb) * 1e-3);
   };
 
-  /* =====================================================================
-   * 1. MOTOR — tipo, parâmetros elétricos, medição automática de R & L
-   * ===================================================================== */
-  {
-    let iType, iPoles, iR, iL, iCurLim, iCalCur, bMeasure, measured = { R: false, L: false };
+  // Erros físicos da ODrive em hex para facilitar diagnóstico.
+  const hexErr = v => {
+    const n = parseInt(v) || 0;
+    return n === 0 ? '0' : ('0x' + (n >>> 0).toString(16).toUpperCase());
+  };
 
-    async function measureRL() {
-      if (!S.dev) { setStatus('Selecione primeiro um atuador na etapa 0.', 'err'); return; }
-      bMeasure.disabled = true;
-      measured = { R: false, L: false };
-      try {
-        // 1) roda MOTOR_CALIBRATION(4): a ODrive mede fase R/L com spin-dir identificação
-        setStatus('Salvando tipo de motor e corrente de calibração…');
-        await setA('motor.config.motor_type', Number(iType.value));
-        await setA('motor.config.pole_pairs', Number(iPoles.value || 7));
-        await setA('motor.config.current_lim', Number(iCurLim.value || 10));
-        await setA('motor.config.calibration_current', Number(iCalCur.value || 10));
-        await setA('motor.config.resistance_calib_max_voltage', Number(iCalCur.value || 10) / 2);
-
-        setStatus('Solicitando MOTOR_CALIBRATION (estado 4)…');
-        await odrive.reqState(AXIS.MOTOR_CALIB);
-
-        // 2) aguarda o eixo voltar a IDLE (polling de current_state)
-        const t0 = Date.now();
-        let st = AXIS.MOTOR_CALIB;
-        while (Date.now() - t0 < 20000) {
-          await new Promise(r => setTimeout(r, 500));
-          st = await getA('current_state');
-          if (st === AXIS.IDLE) break;
-        }
-        if (st !== AXIS.IDLE) { setStatus('Timeout na calibração — verifique motor/config', 'err'); return; }
-
-        // 3) erro de calibração?
-        const err = await getA('error');
-        const mErr = await getA('motor.error');
-        if (err || mErr) { setStatus(`Calibração falhou — axis.error=0x${Number(err).toString(16)} motor.error=0x${Number(mErr).toString(16)}`, 'err'); return; }
-
-        // 4) lê R/L medidos
-        const R = await getA('motor.config.phase_resistance');
-        const L = await getA('motor.config.phase_inductance');
-        measured.R = true; measured.L = true;
-        S.profile.motor = { type: Number(iType.value), pole_pairs: Number(iPoles.value), R, L, current_lim: Number(iCurLim.value) };
-        iR.value = fmt(R, 6); iL.value = fmt(L, 9);
-        setStatus(`Medido! R = ${fmt(R, 5)} Ω  ·  L = ${fmt(L * 1e6, 1)} µH`, 'ok');
-      } catch (e) {
-        setStatus('Falha na medição: ' + e.message, 'err');
-      } finally { bMeasure.disabled = false; }
-    }
-
-    STEPS.push({
-      id: 'motor', title: '1. Motor', desc: 'Tipo do motor e parâmetros elétricos (pole pairs, resistência e indutância de fase).',
-      body(b) {
-        iType   = sel(MOTOR_TYPES, 0);
-        iPoles  = num(7, 1, 1);
-        iR      = num(0, 'any', 0); iR.readOnly = true;
-        iL      = num(0, 'any', 0); iL.readOnly = true;
-        iCurLim = num(10, 0.5, 0);
-        iCalCur = num(10, 0.5, 0);
-        bMeasure = btn('Medir R & L', 'primary');
-        bMeasure.onclick = measureRL;
-
-        b.append(
-          note('A medição automática gira/energiza as fases — deixe a carga livre para mover.', 'warn'),
-          grid(
-            field('Tipo do motor', iType),
-            field('Pole pairs (pares de polos)', iPoles),
-          ),
-          grid(
-            field('Corrente limite [A]', iCurLim),
-            field('Corrente de calibração [A]', iCalCur),
-          ),
-          grid(
-            field('Resistência de fase R [Ω]', iR),
-            field('Indutância de fase L [H]', iL),
-          ),
-          row(bMeasure),
-          statusLine(),
-        );
-      },
-      canFinish: () => measured.R && measured.L ? true : (setStatus('Meça R & L antes de avançar.', 'warn') || false),
+  // Espera até que getA(path) satisfaça pred, com timeout.
+  function pollUntil(path, pred, timeoutMs = 30000, periodMs = 300) {
+    return new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      (async function tick() {
+        let v = null;
+        try { v = await getA(path); } catch (e) { /* ignora e tenta de novo */ }
+        if (v !== null && v !== undefined && pred(v)) return resolve(v);
+        if (Date.now() - t0 > timeoutMs) return reject(new Error('timeout aguardando ' + path + ' (último valor: ' + v + ')'));
+        setTimeout(tick, periodMs);
+      })();
     });
   }
 
-  /* =====================================================================
-   * 2. ATUADOR — fuso de esferas: passo (mm/volta) e curso útil (mm)
-   * ===================================================================== */
+  /* ===================== 1. Motor ===================== */
   {
-    let iPitch, iStroke, iInvert, vInfo;
-    STEPS.push({
-      id: 'actuator', title: '2. Atuador (fuso de esferas)', desc: 'Geometria do fuso que converte rotação do motor em deslocamento linear.',
-      body(b) {
-        iPitch  = num(S.pitch_mm, 0.1, 0.01);
-        iStroke = num(S.stroke_mm, 1, 1);
-        iInvert = document.createElement('input'); iInvert.type = 'checkbox'; iInvert.checked = S.invert;
-        vInfo = note('', 'info');
+    const id = 'motor';
+    let iType, iPoles, iIlim, iIcal, iVcal, oR, oL, noteEl;
+    let measured = false;
 
-        const update = () => {
-          S.pitch_mm = Number(iPitch.value || 5);
-          S.stroke_mm = Number(iStroke.value || 150);
-          S.invert = iInvert.checked;
-          const turns = mm2turn(S.stroke_mm);
-          vInfo.textContent = `Curso de ${fmt(S.stroke_mm, 0)} mm = ${fmt(turns, 2)} voltas do motor · velocidade reference: 1 volta/s ↦ ${fmt(S.pitch_mm, 1)} mm/s`;
-          S.profile.actuator = { pitch_mm: S.pitch_mm, stroke_mm: S.stroke_mm, invert: S.invert };
+    STEPS.push({
+      id,
+      title: '1. Motor',
+      desc: 'Parâmetros elétricos do motor e medição de resistência/indutância de fase (R & L).',
+      canFinish() { return S.stepOk.motor === true; },
+      body(b) {
+        S.stepOk.motor = false; measured = false;
+        iType = sel([[0, 'HIGH_CURRENT (0)'], [2, 'GIMBAL (2)']], 0);
+        iPoles = num(7, 1, 1);
+        iIlim  = num(20, 0.5, 0);
+        iIcal  = num(10, 0.5, 0);
+        iVcal  = num(4, 0.5, 0);
+        oR = num(); oR.readOnly = true; oR.value = '';
+        oL = num(); oL.readOnly = true; oL.value = '';
+        noteEl = note('1) Aplique os parâmetros. 2) Meça R & L. 3) Verifique.', 'info');
+
+        const bApply = btn('Aplicar', 'primary');
+        const bMeas  = btn('Medir R & L');
+        const bVer   = btn('Verificar', 'ok');
+
+        bApply.onclick = async () => {
+          try {
+            await setA('motor.config.motor_type', +iType.value);
+            await setA('motor.config.pole_pairs', +iPoles.value);
+            await setA('motor.config.current_lim', +iIlim.value);
+            await setA('motor.config.calibration_current', +iIcal.value);
+            await setA('motor.config.resistance_calib_max_voltage', +iVcal.value);
+            Object.assign(S.profile, {
+              motor_type: +iType.value, pole_pairs: +iPoles.value,
+              current_lim: +iIlim.value, calibration_current: +iIcal.value,
+              resistance_calib_max_voltage: +iVcal.value,
+            });
+            noteEl.className = 'notice info';
+            noteEl.textContent = 'Parâmetros do motor aplicados. Agora clique em "Medir R & L".';
+            log('motor: parâmetros aplicados (type=' + iType.value + ', poles=' + iPoles.value + ', Ilim=' + iIlim.value + ')');
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao aplicar: ' + e.message; log('motor apply falhou: ' + e.message); }
         };
-        [iPitch, iStroke, iInvert].forEach(x => x.oninput = update);
-        update();
 
-        b.append(
-          grid(
-            field('Passo do fuso [mm/volta]', iPitch),
-            field('Curso útil [mm]', iStroke),
-          ),
-          field('Inverter direção (+ = recuar)', iInvert),
-          vInfo,
-          note(`O encoder deve reportar múltiplas voltas (use circular ou absoluto com multi-turn).`, 'info'),
-        );
+        bMeas.onclick = async () => {
+          bMeas.disabled = true;
+          noteEl.className = 'notice info';
+          noteEl.textContent = 'Medindo R & L… o motor vai emitir um beep e vibrar levemente.';
+          try {
+            await odrive.reqState(4); // MOTOR_CALIBRATION
+            await pollUntil('current_state', s => parseInt(s) === 1, 30000); // volta a IDLE
+            const axErr = await getA('error');
+            const moErr = await getA('motor.error');
+            if ((parseInt(axErr) || 0) !== 0 || (parseInt(moErr) || 0) !== 0) {
+              throw new Error('falha na calibração do motor — axis.error=' + hexErr(axErr) + ' motor.error=' + hexErr(moErr));
+            }
+            const R = await getA('motor.config.phase_resistance');
+            const L = await getA('motor.config.phase_inductance');
+            oR.value = R; oL.value = L;
+            S.profile.phase_resistance = R; S.profile.phase_inductance = L;
+            measured = true;
+            S.stepOk.motor = false; // exige nova verificação
+            noteEl.className = 'notice ok';
+            noteEl.textContent = 'R = ' + fmt(R, 4) + ' Ω, L = ' + fmt(L * 1e6, 1) + ' µH. Clique em "Verificar".';
+            log('motor: medida ok R=' + fmt(R, 4) + 'Ω L=' + fmt(L * 1e6, 1) + 'µH');
+          } catch (e) {
+            noteEl.className = 'notice warn';
+            noteEl.textContent = 'Medição falhou: ' + e.message;
+            log('motor medida falhou: ' + e.message);
+          }
+          bMeas.disabled = false;
+        };
+
+        bVer.onclick = async () => {
+          try {
+            const mt = await getA('motor.config.motor_type');
+            const pp = await getA('motor.config.pole_pairs');
+            const il = await getA('motor.config.current_lim');
+            const ic = await getA('motor.config.calibration_current');
+            const vc = await getA('motor.config.resistance_calib_max_voltage');
+            const ok = eq(mt, iType.value, 0.1) && eq(pp, iPoles.value, 0.1) && eq(il, iIlim.value)
+                    && eq(ic, iIcal.value) && eq(vc, iVcal.value);
+            if (ok && measured) {
+              S.stepOk.motor = true;
+              S.done.add(id);
+              noteEl.className = 'notice ok';
+              noteEl.textContent = '✓ Motor verificado (parâmetros + medição de R & L). Pode avançar.';
+              log('motor: verificação ok');
+            } else if (ok) {
+              noteEl.className = 'notice warn';
+              noteEl.textContent = 'Parâmetros conferem, mas falta medir R & L com sucesso.';
+            } else {
+              S.stepOk.motor = false;
+              noteEl.className = 'notice warn';
+              noteEl.textContent = 'Verificação FALHOU: valores relidos diferem (type=' + mt + ', poles=' + pp + ', Ilim=' + fmt(il, 1) + ').';
+              log('motor: verificação falhou');
+            }
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
+        };
+
+        b.append(noteEl,
+                 grid(field('Tipo de motor', iType), field('Pole pairs', iPoles),
+                      field('Limite de corrente [A]', iIlim), field('Corrente de calibração [A]', iIcal),
+                      field('Tensão máx. calib. R [V]', iVcal)),
+                 grid(field('Resistência de fase [Ω]', oR), field('Indutância de fase [H]', oL)),
+                 row(bApply, bMeas, bVer));
       },
-      onFinish() { /* persiste a geometria em S (já feito em update) */ },
     });
   }
 
-  /* =====================================================================
-   * 3. CALIBRAÇÃO DE ESTADO — homing por endstop OU por stall-current
-   * ===================================================================== */
+  /* ===================== 2. Atuador (fuso) ===================== */
   {
-    let mode = 'endstop'; // 'endstop' | 'stall'
-    let eDelay, eDir, eOffset, eIdx, ePolarity;                    // endstop
-    let sIq, sVel, sMinVel, sTime, sMinDist, sDir, sOffset;       // stall
-    let bRun, bodyEl;
-
-    const endstopPanel = () => grid(
-      field('Pino do endstop (GPIO)', eIdx),
-      field('Polaridade (1=fechado)', ePolarity),
-      field('Direção do homing (-1=min, 1=max)', eDir),
-      field('Debounce [ms]', eDelay),
-      field('Offset após homing [mm]', eOffset),
-    );
-
-    const stallPanel = () => grid(
-      field('Corrente de stall Iq [A]', sIq),
-      field('Velocidade de homing [turns/s]', sVel),
-      field('Vel. mín. para detectar batente [turns/s]', sMinVel),
-      field('Tempo de confirmação [ms]', sTime),
-      field('Distância mínima de prova [mm]', sMinDist),
-      field('Direção (-1=min, 1=max)', sDir),
-      field('Offset após homing [mm]', sOffset),
-    );
-
-    async function runHoming() {
-      if (!S.dev) { setStatus('Selecione um atuador na etapa 0.', 'err'); return; }
-      bRun.disabled = true;
-      try {
-        // >>> configurar modo escolhido <<<
-        if (mode === 'endstop') {
-          log('Configurando homing por ENDSTOP…');
-          await setA('min_endstop.config.enabled', 1);
-          await setA('min_endstop.config.gpio_num', Number(eIdx.value || 2));
-          await setA('min_endstop.config.is_active_high', Number(ePolarity.value || 1));
-          await setA('min_endstop.config.offset',-mm2turn(Number(eOffset.value || 0)));
-          await setA('min_endstop.config.debounce_ms', Number(eDelay.value || 50));
-          await setA('encoder.config.use_index', Number(eIdx.value ? 0 : 0)); // endstop não usa index
-        } else {
-          log('Configurando homing por STALL-CURRENT (batente)…');
-          await setA('min_endstop.config.enabled', 0); // sem endstop físico
-          // parâmetros de stall-homing gravados via trap_traj/min_endstop custom ou config dedicada do firmware
-          await setA('stall_homing.config.iq_thres', Number(sIq.value || 2));           // corrente de stall
-          await setA('stall_homing.config.vel', mm2turn(1) * Number(sVel.value || 1));  // turn/s desejados
-          await setA('stall_homing.config.min_vel_detect', Number(sMinVel.value || 0.1));
-          await setA('stall_homing.config.confirm_time_ms', Number(sTime.value || 100));
-          await setA('stall_homing.config.min_probe_dist', mm2turn(Number(sMinDist.value || 10)));
-          await setA('stall_homing.config.dir', Number(sDir.value || -1));
-          await setA('stall_homing.config.offset', mm2turn(Number(sOffset.value || 1)));
-        }
-        await setA('encoder.config.mode', 0); // encoder incremental padrão do atuador
-
-        // >>> sequência: index (opcional) → homing <<<
-        setStatus('Entrando em HOMING (estado 6)… siga o movimento, carga livre!', 'warn');
-        await odrive.reqState(AXIS.HOMING);
-
-        const t0 = Date.now(); let st = AXIS.HOMING;
-        while (Date.now() - t0 < 45000) {
-          await new Promise(r => setTimeout(r, 500));
-          st = await getA('current_state');
-          if (st === AXIS.IDLE) break;
-        }
-        const err = await getA('error');
-        if (st !== AXIS.IDLE || err) {
-          setStatus(`Homing falhou — state=${st} axis.error=0x${Number(err || 0).toString(16)} encoder.erro=${await getA('encoder.error')}`, 'err');
-        } else {
-          const pos = await getA('encoder.pos_estimate');
-          setStatus(`Homing OK — posição zero definida. pos_estimate = ${fmt(turn2mm(pos), 2)} mm`, 'ok');
-        }
-      } catch (e) { setStatus('Homing: ' + e.message, 'err'); }
-      finally { bRun.disabled = false; }
-    }
+    const id = 'actuator';
 
     STEPS.push({
-      id: 'calibration', title: '3. Calibração de Estado (homing)', desc: 'Define a posição zero do atuador — por chave de fim de curso (endstop) ou por batente com detecção de corrente (stall).',
+      id,
+      title: '2. Atuador (fuso)',
+      desc: 'Geometria do fuso de esferas e limites derivados no controlador.',
+      canFinish() { return S.stepOk.actuator === true; },
       body(b) {
-        bodyEl = b;
-        // endstop defaults
-        eIdx = num(2, 1, 0); ePolarity = sel([[1, 'Ativo alto (1)'], [0, 'Ativo baixo (0)']], 1);
-        eDir = sel([[-1, '−1 (recua até o fim mínimo)'], [1, '+1 (avança ao fim máximo)']], -1);
-        eDelay = num(50, 10, 0); eOffset = num(2, 0.5);
-        // stall defaults
-        sIq = num(2, 0.1, 0.1); sVel = num(1, 0.1, 0.1); sMinVel = num(0.1, 0.05, 0);
-        sTime = num(100, 10, 10); sMinDist = num(10, 1, 1);
-        sDir = sel([[-1, '−1 (recua até batente)'], [1, '+1 (avança até batente)']], -1);
-        sOffset = num(1, 0.5);
+        S.stepOk.actuator = false;
+        const iPitch = num(S.pitch_mm, 0.5, 0.1);
+        const iStroke = num(S.stroke_mm, 1, 1);
+        const iInv = sel([[0, 'Normal'], [1, 'Invertido']], S.invert ? 1 : 0);
+        const iCpr = num(8192, 1, 1);
+        const noteEl = note('Passo e curso definem o vel_limit e os fatores mm↔voltas.', 'info');
 
-        const bEndstop = btn('Endstop (chave de fim de curso)', mode === 'endstop' ? 'primary' : '');
-        const bStall = btn('Stall-current (batente, sem chave)', mode === 'stall' ? 'primary' : '');
-        const panel = el('div');
-        const bRun = btn('Executar homing', 'ok');
-        bRun.onclick = null; // definido abaixo
-        bEndstop.onclick = () => { mode = 'endstop'; bEndstop.className = 'primary'; bStall.className = ''; panel.innerHTML = ''; panel.append(endstopPanel(), note('Requer chave micro-switch em um dos fins de curso ligado a um GPIO da ODrive.', 'info')); };
-        bStall.onclick = () => { mode = 'stall'; bStall.className = 'primary'; bEndstop.className = ''; panel.innerHTML = ''; panel.append(stallPanel(), note('Sem hardware: o motor avança até travar mecanicamente; a subida de corrente define o limite. Use corrente baixa!', 'warn')); };
-        bEndstop.onclick();
-        bRun.onclick = runHoming;
+        const bApply = btn('Aplicar', 'primary');
+        const bVer = btn('Verificar', 'ok');
 
-        b.append(row(bEndstop, bStall), panel, row(bRun), statusLine());
+        const velLim = () => Math.max(1, Math.round((+iStroke.value / +iPitch.value) * 2)); // 2x o curso em voltas/s (razoável p/ fuso)
+
+        bApply.onclick = async () => {
+          try {
+            S.pitch_mm = +iPitch.value; S.stroke_mm = +iStroke.value; S.invert = (+iInv.value === 1);
+            await setA('encoder.config.cpr', +iCpr.value);
+            await setA('controller.config.vel_limit', velLim());
+            await setA('controller.config.pos_gain', 20);
+            await setA('controller.config.vel_gain', 0.16);
+            Object.assign(S.profile, {
+              pitch_mm: S.pitch_mm, stroke_mm: S.stroke_mm, invert: S.invert,
+              encoder_cpr: +iCpr.value, vel_limit: velLim(), pos_gain: 20, vel_gain: 0.16,
+            });
+            noteEl.className = 'notice info';
+            noteEl.textContent = 'Atuador aplicado: cpr=' + iCpr.value + ', vel_limit=' + velLim() + ', pos_gain=20, vel_gain=0.16. Clique em "Verificar".';
+            log('atuador: cpr=' + iCpr.value + ' vel_limit=' + velLim());
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao aplicar: ' + e.message; log('atuador apply falhou: ' + e.message); }
+        };
+
+        bVer.onclick = async () => {
+          try {
+            const cpr = await getA('encoder.config.cpr');
+            const vl = await getA('controller.config.vel_limit');
+            const pg = await getA('controller.config.pos_gain');
+            const vg = await getA('controller.config.vel_gain');
+            const ok = eq(cpr, iCpr.value, 0.5) && eq(vl, velLim()) && eq(pg, 20) && eq(vg, 0.16);
+            if (ok) {
+              S.stepOk.actuator = true; S.done.add(id);
+              noteEl.className = 'notice ok';
+              noteEl.textContent = '✓ Atuador verificado. Pode avançar.';
+              log('atuador: verificação ok');
+            } else {
+              S.stepOk.actuator = false;
+              noteEl.className = 'notice warn';
+              noteEl.textContent = 'Verificação FALHOU: cpr=' + cpr + ', vel_limit=' + vl + ', pos_gain=' + fmt(pg, 1) + ', vel_gain=' + fmt(vg, 3);
+            }
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
+        };
+
+        b.append(noteEl,
+                 grid(field('Passo do fuso [mm/volta]', iPitch), field('Curso útil [mm]', iStroke),
+                      field('Sentido', iInv), field('Encoder CPR', iCpr)),
+                 row(bApply, bVer));
       },
     });
   }
 
-  /* =====================================================================
-   * 4. TUNING — ganhos do cascata pos/vel + presets + teste em closed-loop
-   * ===================================================================== */
+  /* ===================== 3. Calibração / Homing ===================== */
   {
-    let iPos, iVel, iInt, bApply, bClosed, bIdle, bStepTgt, cv, liveTimer;
+    const id = 'homing';
+    let modeSel, boxEnd, boxStall, noteEl;
+
+    STEPS.push({
+      id,
+      title: '3. Calibração/Homing',
+      desc: 'Referência de zero do atuador: endstop (fim de curso físico) ou detecção de batente por corrente.',
+      canFinish() { return S.stepOk.homing === true; },
+      body(b) {
+        S.stepOk.homing = false;
+        modeSel = sel([['endstop', 'Endstop (fim de curso)'], ['stall', 'Stall-current (batente)']], 'endstop');
+
+        const eGpio = num(5, 1, 1);
+        const eHigh = sel([[0, 'Ativo em LOW'], [1, 'Ativo em HIGH']], 0);
+        const eOff = num(0, 0.5);
+        const eDeb = num(50, 10, 0);
+
+        const sSpeed = num(1.0, 0.1, 0.1);
+        const sCur = num(4.0, 0.5, 0.5);
+        const sVel = num(0.2, 0.05, 0.01);
+        const sTime = num(0.4, 0.1, 0.05);
+        const sOff = num(5.0, 0.5);
+        const sMax = num(1.2, 0.1, 0.1);
+
+        boxEnd = el('div');
+        boxStall = el('div');
+        boxEnd.append(grid(field('GPIO do endstop', eGpio), field('Polaridade', eHigh),
+                           field('Offset [mm]', eOff), field('Debounce [ms]', eDeb)));
+        boxStall.append(grid(field('Velocidade de homing [turn/s]', sSpeed), field('Corrente de stall [A]', sCur),
+                             field('Vel. de stall [turn/s]', sVel), field('Tempo de stall [s]', sTime),
+                             field('Offset pós-stall [mm]', sOff), field('Distância máx. [voltas]', sMax)));
+
+        const upd = () => {
+          boxEnd.style.display = modeSel.value === 'endstop' ? '' : 'none';
+          boxStall.style.display = modeSel.value === 'stall' ? '' : 'none';
+        };
+        modeSel.onchange = upd; upd();
+
+        noteEl = note('Configure o modo, aplique e execute o homing. O eixo precisa retornar homed sem erros.', 'info');
+        const bApply = btn('Aplicar', 'primary');
+        const bHome = btn('Executar homing');
+        const bVer = btn('Verificar', 'ok');
+
+        bApply.onclick = async () => {
+          try {
+            const isEnd = modeSel.value === 'endstop';
+            await setA('controller.config.homing_mode', isEnd ? 1 : 2); // 1=endstop, 2=stall (fw custom)
+            if (isEnd) {
+              await setA('min_endstop.config.gpio_num', +eGpio.value);
+              await setA('min_endstop.config.is_active_high', +eHigh.value === 1);
+              await setA('min_endstop.config.offset', mm2turn(+eOff.value));
+              await setA('min_endstop.config.debounce_ms', +eDeb.value);
+              Object.assign(S.profile, { homing_mode: 'endstop', endstop_gpio: +eGpio.value, endstop_active_high: +eHigh.value === 1, endstop_offset_mm: +eOff.value, endstop_debounce_ms: +eDeb.value });
+            } else {
+              await setA('controller.config.homing_speed', +sSpeed.value);
+              await setA('controller.config.homing_stall_current', +sCur.value);
+              await setA('controller.config.homing_stall_vel', +sVel.value);
+              await setA('controller.config.homing_stall_time', +sTime.value);
+              await setA('controller.config.homing_offset', mm2turn(+sOff.value));
+              await setA('controller.config.homing_max_distance', +sMax.value);
+              Object.assign(S.profile, { homing_mode: 'stall', homing_speed: +sSpeed.value, homing_stall_current: +sCur.value, homing_stall_vel: +sVel.value, homing_stall_time: +sTime.value, homing_offset_mm: +sOff.value, homing_max_distance: +sMax.value });
+            }
+            S.stepOk.homing = false;
+            noteEl.className = 'notice info';
+            noteEl.textContent = 'Configuração de homing aplicada. Execute o homing e depois verifique.';
+            log('homing: config aplicada (modo ' + modeSel.value + ')');
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao aplicar: ' + e.message; log('homing apply falhou: ' + e.message); }
+        };
+
+        bHome.onclick = async () => {
+          bHome.disabled = true;
+          noteEl.className = 'notice info';
+          noteEl.textContent = 'Executando homing… o atuador vai se mover até a referência.';
+          try {
+            await odrive.reqState(6); // HOMING
+            await pollUntil('current_state', s => parseInt(s) === 1, 60000, 400);
+            const axErr = await getA('error');
+            const homed = await getA('is_homed');
+            if ((parseInt(axErr) || 1) !== 0) throw new Error('axis.error=' + hexErr(axErr));
+            if (parseInt(homed) !== 1) throw new Error('eixo não reportou is_homed=1');
+            S.stepOk.homing = true; S.done.add(id);
+            noteEl.className = 'notice ok';
+            noteEl.textContent = '✓ Homing concluído: is_homed=1, error=0. Clique em "Verificar" para confirmar.';
+            log('homing: ok (is_homed=1)');
+          } catch (e) {
+            S.stepOk.homing = false;
+            noteEl.className = 'notice warn';
+            noteEl.textContent = 'Homing falhou: ' + e.message;
+            log('homing falhou: ' + e.message);
+          }
+          bHome.disabled = false;
+        };
+
+        bVer.onclick = async () => {
+          try {
+            const hm = await getA('controller.config.homing_mode');
+            const homed = await getA('is_homed');
+            const axErr = await getA('error');
+            const wantMode = modeSel.value === 'endstop' ? 1 : 2;
+            const ok = eq(hm, wantMode, 0.1) && parseInt(homed) === 1 && (parseInt(axErr) || 1) === 0 && S.stepOk.homing === true;
+            if (ok) {
+              noteEl.className = 'notice ok';
+              noteEl.textContent = '✓ Homing verificado (modo=' + modeSel.value + ', homed=1, error=0). Pode avançar.';
+              log('homing: verificação ok');
+            } else {
+              S.stepOk.homing = false; S.done.delete(id);
+              noteEl.className = 'notice warn';
+              noteEl.textContent = 'Verificação FALHOU: homing_mode=' + hm + ', is_homed=' + homed + ', error=' + hexErr(axErr) + '.';
+            }
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
+        };
+
+        b.append(noteEl, field('Modo de homing', modeSel), boxEnd, boxStall, row(bApply, bHome, bVer));
+      },
+    });
+  }
+
+  /* ===================== 4. Tuning ===================== */
+  {
+    const id = 'tuning';
+    let iPg, iVg, iVi, noteEl;
+
     const PRESETS = {
-      conservador: { pos: 10, vel: 0.08, int: 0.2, desc: 'Suave, sem overshoot. Bom para primeiros testes e cargas com folga.' },
-      equilibrado: { pos: 20, vel: 0.16, int: 0.32, desc: 'Padrão ODrive — bom compromisso entre rigidez e estabilidade.' },
-      agressivo: { pos: 40, vel: 0.32, int: 0.6, desc: 'Resposta rápida e rígida. Exige mecânica firme — risco de oscilação.' },
+      conservador: { pg: 10, vg: 0.10, vi: 0.15 },
+      equilibrado: { pg: 20, vg: 0.16, vi: 0.30 },
+      agressivo:   { pg: 40, vg: 0.25, vi: 0.50 },
     };
-    let curPreset = 'equilibrado';
-
-    async function applyGains() {
-      try {
-        await setA('controller.config.pos_gain', Number(iPos.value));
-        await setA('controller.config.vel_gain', Number(iVel.value));
-        await setA('controller.config.vel_integrator_gain', Number(iInt.value));
-        S.profile.tuning = { pos_gain: +iPos.value, vel_gain: +iVel.value, vel_integrator_gain: +iInt.value, preset: curPreset };
-        setStatus(`Ganhos aplicados: pos=${fmt(iPos.value, 1)} vel=${fmt(iVel.value, 3)} int=${fmt(iInt.value, 3)} (${curPreset})`, 'ok');
-      } catch (e) { setStatus('Falha ao aplicar ganhos: ' + e.message, 'err'); }
-    }
-
-    async function enterClosedLoop() {
-      try {
-        setStatus('Solicitando CLOSED_LOOP_CONTROL (estado 8)…', 'warn');
-        await odrive.reqState(AXIS.CLOSED_LOOP);
-        await new Promise(r => setTimeout(r, 300));
-        const st = await getA('current_state');
-        const err = await getA('error');
-        if (Number(st) === AXIS.CLOSED_LOOP) {
-          setStatus('Closed-loop ATIVO — o motor segue pos_setpoint. Use o botão de passo para testar.', 'ok');
-        } else {
-          setStatus(`Não entrou em closed-loop — state=${st} error=0x${Number(err || 0).toString(16)}. Calibração pendente?`, 'err');
-        }
-      } catch (e) { setStatus('Closed-loop: ' + e.message, 'err'); }
-    }
-
-    async function exitToIdle() {
-      await odrive.reqState(AXIS.IDLE);
-      setStatus('Eixo em IDLE — energia desligada das fases.', 'info');
-    }
-
-    async function stepTarget(mm) {
-      const cur = await getA('controller.input_pos') ?? 0;
-      await setA('controller.input_mode', 5); // INPUT_MODE_TRAP_TRAJ
-      await setA('controller.input_pos', cur + mm2turn(mm));
-      setStatus(`Comando: +${mm} mm → input_pos = ${fmt(turn2mm(cur + mm2turn(mm)), 2)} mm`, 'info');
-    }
 
     STEPS.push({
-      id: 'tuning', title: '4. Tuning de Controle', desc: 'Ganhos do controlador em cascata (posição → velocidade → corrente) e teste do servo em malha fechada.',
+      id,
+      title: '4. Tuning',
+      desc: 'Ganhos do controlador de posição. Comece conservador; suba só se o movimento ficar lento demais.',
+      canFinish() { return S.stepOk.tuning === true; },
       body(b) {
-        const p = PRESETS[curPreset];
-        iPos = num(p.pos, 1, 0); iVel = num(p.vel, 0.01, 0); iInt = num(p.int, 0.01, 0);
+        S.stepOk.tuning = false;
+        const preset = sel([['conservador', 'Conservador'], ['equilibrado', 'Equilibrado'], ['agressivo', 'Agressivo']], 'equilibrado');
+        iPg = num(20, 1, 0); iVg = num(0.16, 0.01, 0); iVi = num(0.30, 0.01, 0);
+        preset.onchange = () => { const p = PRESETS[preset.value]; iPg.value = p.pg; iVg.value = p.vg; iVi.value = p.vi; };
 
-        const makePresetBtn = (key, label) => {
-          const bp = btn(label, key === curPreset ? 'primary' : '');
-          bp.onclick = () => {
-            curPreset = key;
-            iPos.value = PRESETS[key].pos; iVel.value = PRESETS[key].vel; iInt.value = PRESETS[key].int;
-            [...presetRow.children].forEach(x => x.className = ''); bp.className = 'primary';
-            dDesc.textContent = PRESETS[key].desc;
-          };
-          return bp;
+        noteEl = note('Aplique os ganhos, teste em malha fechada e verifique.', 'info');
+        const bApply = btn('Aplicar', 'primary');
+        const bVer = btn('Verificar', 'ok');
+        const bCL = btn('Entrar em malha fechada (8)');
+        const bIdle = btn('Sair para IDLE (1)');
+
+        bApply.onclick = async () => {
+          try {
+            await setA('controller.config.pos_gain', +iPg.value);
+            await setA('controller.config.vel_gain', +iVg.value);
+            await setA('controller.config.vel_integrator_gain', +iVi.value);
+            Object.assign(S.profile, { pos_gain: +iPg.value, vel_gain: +iVg.value, vel_integrator_gain: +iVi.value });
+            S.stepOk.tuning = false;
+            noteEl.className = 'notice info';
+            noteEl.textContent = 'Ganhos aplicados. Teste em malha fechada e clique em "Verificar".';
+            log('tuning: pg=' + iPg.value + ' vg=' + iVg.value + ' vi=' + iVi.value);
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao aplicar: ' + e.message; }
         };
-        const presetRow = row(
-          makePresetBtn('conservador', 'Conservador'),
-          makePresetBtn('equilibrado', 'Equilibrado'),
-          makePresetBtn('agressivo', 'Agressivo'),
-        );
-        const dDesc = note(PRESETS[curPreset].desc, 'info');
 
-        bApply = btn('Aplicar ganhos', 'primary'); bApply.onclick = applyGains;
-        bClosed = btn('Entrar em closed-loop (8)', 'ok'); bClosed.onclick = enterClosedLoop;
-        bIdle = btn('Sair para IDLE (1)'); bIdle.onclick = exitToIdle;
-        const bP10 = btn('+10 mm'); bP10.onclick = () => stepTarget(+10);
-        const bM10 = btn('−10 mm'); bM10.onclick = () => stepTarget(-10);
-        const bP50 = btn('+50 mm'); bP50.onclick = () => stepTarget(+50);
-        const bM50 = btn('−50 mm'); bM50.onclick = () => stepTarget(-50);
+        bVer.onclick = async () => {
+          try {
+            const pg = await getA('controller.config.pos_gain');
+            const vg = await getA('controller.config.vel_gain');
+            const vi = await getA('controller.config.vel_integrator_gain');
+            const ok = eq(pg, iPg.value) && eq(vg, iVg.value, 1e-3) && eq(vi, iVi.value, 1e-3);
+            if (ok) {
+              S.stepOk.tuning = true; S.done.add(id);
+              noteEl.className = 'notice ok';
+              noteEl.textContent = '✓ Ganhos verificados na ODrive. Pode avançar.';
+              log('tuning: verificação ok');
+            } else {
+              S.stepOk.tuning = false;
+              noteEl.className = 'notice warn';
+              noteEl.textContent = 'Verificação FALHOU: relido pg=' + fmt(pg, 1) + ' vg=' + fmt(vg, 3) + ' vi=' + fmt(vi, 3);
+            }
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
+        };
 
-        cv = el('canvas', 'plot');
-        cv.width = 640; cv.height = 120;
-        odrive.subscribe(50).then(() => { liveTimer = setInterval(() => drawPlot(cv), 50); }).catch(() => {});
+        bCL.onclick = async () => {
+          try {
+            await odrive.reqState(8); // CLOSED_LOOP_CONTROL
+            const st = await getA('current_state');
+            const axErr = await getA('error');
+            if (parseInt(st) === 8 && (parseInt(axErr) || 1) === 0) {
+              log('tuning: malha fechada ativa');
+              noteEl.className = 'notice ok';
+              noteEl.textContent = 'Malha fechada ativa (state=8, error=0). O motor vai segurar posição — não force o eixo.';
+            } else {
+              throw new Error('state=' + st + ', error=' + hexErr(axErr));
+            }
+          } catch (e) { log('closed-loop falhou: ' + e.message); noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao entrar em malha fechada: ' + e.message; }
+        };
 
-        b.append(
-          presetRow, dDesc,
-          grid(
-            field('pos_gain [(turn/s)/turn]', iPos),
-            field('vel_gain [A·s/turn]', iVel),
-            field('vel_integrator_gain [A/turn]', iInt),
-          ),
-          row(bApply),
-          note('Após aplicar, entre em closed-loop e teste com passos de posição. A curva azul (posição) deve seguir a laranja (alvo) sem oscilação persistente.', 'info'),
-          row(bClosed, bIdle),
-          row(bM50, bM10, bP10, bP50),
-          cv,
-          statusLine(),
-        );
+        bIdle.onclick = async () => {
+          try {
+            await odrive.reqState(1);
+            const st = await getA('current_state');
+            if (parseInt(st) === 1) log('tuning: volta a IDLE');
+            else log('tuning: atenção — state relido = ' + st);
+          } catch (e) { log('idle falhou: ' + e.message); }
+        };
+
+        b.append(noteEl,
+                 grid(field('Preset', preset), field('pos_gain', iPg),
+                      field('vel_gain', iVg), field('vel_integrator_gain', iVi)),
+                 row(bApply, bVer), row(bCL, bIdle));
       },
-      onLeave() { if (liveTimer) { clearInterval(liveTimer); liveTimer = null; } odrive.unsubscribe(); },
     });
   }
 
-  /* =====================================================================
-   * 5. TESTE DE MOVIMENTO — jog em mm, varredura 0→curso→0, telemetria live
-   * ===================================================================== */
+  /* ===================== 5. Teste de movimento ===================== */
   {
-    let iStep, cv, liveTimer, sweeping = false;
+    const id = 'motiontest';
+    let cv, noteEl, timer = null, plotTimer = null;
+
+    // alimenta o plot com telemetria ao vivo
+    const onTel = () => { if (cv) drawPlot(cv); };
+
+    async function jog(mm) {
+      const pos = await getA('encoder.pos_estimate');
+      const alvo = (pos || 0) + mm2turn(mm);
+      await setA('controller.config.input_mode', 6);   // TRAP_TRAJ
+      await setA('controller.config.control_mode', 3); // POSITION_CONTROL
+      await setA('controller.input_pos', alvo);        // (não input_position)
+      log('jog ' + (mm > 0 ? '+' : '') + mm + ' mm (alvo=' + fmt(turn2mm(alvo), 1) + ' mm)');
+    }
 
     async function ensureClosedLoop() {
       const st = await getA('current_state');
-      if (Number(st) !== AXIS.CLOSED_LOOP) {
-        setStatus('Eixo não está em closed-loop — ativando (estado 8)…', 'warn');
-        await odrive.reqState(AXIS.CLOSED_LOOP);
-        await new Promise(r => setTimeout(r, 300));
-      }
-    }
-
-    async function jog(dir) {
-      if (!S.dev) { setStatus('Selecione um atuador na etapa 0.', 'err'); return; }
-      const mm = Number(iStep.value || 5) * dir;
-      try {
-        await ensureClosedLoop();
-        const cur = await getA('encoder.pos_estimate');
-        await setA('controller.input_mode', 6); // INPUT_MODE_TRAP_TRAJ
-        const tgt = Number(cur) + mm2turn(mm);
-        await setA('controller.input_position', tgt);
-        setStatus(`Jog ${mm > 0 ? '+' : ''}${mm} mm → alvo ${fmt(turn2mm(tgt), 2)} mm`, 'info');
-      } catch (e) { setStatus('Jog: ' + e.message, 'err'); }
-    }
-
-    // guarda de segurança: aborta a varredura se o eixo sair de closed-loop ou gerar erro
-    async function watchGuard(cancel) {
-      while (!cancel.cancelled && sweeping) {
-        try {
-          const [st, err] = await Promise.all([getA('current_state'), getA('error')]);
-          if (Number(st) !== AXIS.CLOSED_LOOP && Number(st) !== AXIS.IDLE) continue;
-          if (Number(err)) { cancel.cancelled = true; setStatus(`ERRO 0x${Number(err).toString(16)} — varredura abortada, eixo em IDLE.`, 'err'); await odrive.reqState(AXIS.IDLE).catch(() => {}); }
-          if (Number(st) === AXIS.IDLE) { cancel.cancelled = true; setStatus('Eixo caiu para IDLE — varredura abortada.', 'err'); }
-        } catch (_) { /* ignora erro transitório de leitura */ }
-        await new Promise(r => setTimeout(r, 150));
-      }
-    }
-
-    async function moveTo(mmPos, cancel) {
-      await setA('controller.input_mode', 6);
-      await setA('controller.input_position', mm2turn(mmPos));
-      // espera chegar perto do alvo (ou cancelamento)
-      const t0 = Date.now();
-      while (!cancel.cancelled && Date.now() - t0 < 60000) {
-        await new Promise(r => setTimeout(r, 200));
-        const pos = await getA('encoder.pos_estimate');
-        if (Math.abs(turn2mm(pos) - mmPos) < 0.5) break;
-      }
-    }
-
-    async function sweep() {
-      if (!S.dev) { setStatus('Selecione um atuador na etapa 0.', 'err'); return; }
-      const homed = await getA('is_homed').catch(() => 1);
-      if (!Number(homed)) { setStatus('Eixo NÃO referenciado (is_homed=0) — faça o homing no passo 3 antes de varrer.', 'err'); return; }
-      if (!confirm(`Varredura completa 0 → ${fmt(S.stroke_mm, 0)} mm → 0.\nO eixo vai percorrer TODO o curso em closed-loop.\nCarga livre e área desobstruída?`)) return;
-      sweeping = true;
-      const cancel = { cancelled: false };
-      watchGuard(cancel);
-      try {
-        await ensureClosedLoop();
-        setStatus('Varredura: indo a 0 mm…', 'warn');
-        await moveTo(0, cancel);
-        if (cancel.cancelled) return;
-        setStatus(`Varredura: indo a ${fmt(S.stroke_mm, 0)} mm…`, 'warn');
-        await moveTo(S.stroke_mm, cancel);
-        if (cancel.cancelled) return;
-        setStatus('Varredura: retornando a 0 mm…', 'warn');
-        await moveTo(0, cancel);
-        if (!cancel.cancelled) setStatus('Varredura completa OK — 0 → curso → 0.', 'ok');
-      } catch (e) { setStatus('Varredura: ' + e.message, 'err'); }
-      finally { sweeping = false; }
+      if (parseInt(st) !== 8) await odrive.reqState(8);
     }
 
     STEPS.push({
-      id: 'motiontest', title: '5. Teste de movimento', desc: 'Validação do movimento em closed-loop (jog e varredura de curso) antes de salvar a configuração.',
+      id,
+      title: '5. Teste de movimento',
+      desc: 'Jog em malha fechada, varredura do curso e acompanhamento ao vivo no gráfico.',
+      canFinish() { return S.stepOk.motiontest === true; },
+      onLeave() {
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (plotTimer) { clearInterval(plotTimer); plotTimer = null; }
+        if (S.onTelemetry === onTel) S.onTelemetry = null;
+        odrive.unsubscribe();
+      },
       body(b) {
-        iStep = num(5, 0.5, 0.1);
-        const bJogM = btn('−mm'); bJogM.onclick = () => jog(-1);
-        const bJogP = btn('+mm'); bJogP.onclick = () => jog(+1);
-        const bSweep = btn('Varredura 0→curso→0', 'primary'); bSweep.onclick = sweep;
-        const bStop = btn('STOP (idle)', 'err'); bStop.onclick = async () => { sweeping = false; await odrive.reqState(AXIS.IDLE).catch(() => {}); setStatus('Parado — eixo em IDLE.', 'warn'); };
-        const bPos = btn('Posição atual'); bPos.onclick = async () => {
+        S.stepOk.motiontest = false;
+        const iJog = num(10, 1, 1);
+        noteEl = note('Entre em malha fechada e use o jog. A varredura exige homing concluído.', 'info');
+
+        cv = el('canvas', 'plot');
+        cv.style.width = '100%'; cv.style.height = '160px';
+        S.onTelemetry = onTel;
+        odrive.subscribe(50);
+        plotTimer = setInterval(() => drawPlot(cv), 100);
+
+        const bCL = btn('Malha fechada (8)');
+        const bNeg = btn('◀ Jog −');
+        const bPos = btn('Jog + ▶');
+        const bSweep = btn('Varredura 0 → curso → 0');
+        const bStop = btn('STOP', 'warn');
+        const bVer = btn('Verificar', 'ok');
+
+        bCL.onclick = async () => {
+          try {
+            await odrive.reqState(8);
+            const st = await getA('current_state');
+            if (parseInt(st) !== 8) throw new Error('state relido = ' + st);
+            noteEl.className = 'notice ok';
+            noteEl.textContent = 'Malha fechada ativa. Use o jog.';
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha: ' + e.message; }
+        };
+
+        bNeg.onclick = async () => { try { await jog(-Math.abs(+iJog.value || 10)); } catch (e) { log('jog falhou: ' + e.message); } };
+        bPos.onclick = async () => { try { await jog(Math.abs(+iJog.value || 10)); } catch (e) { log('jog falhou: ' + e.message); } };
+
+        bSweep.onclick = async () => {
+          try {
+            const homed = await getA('is_homed');
+            if (parseInt(homed) !== 1) {
+              noteEl.className = 'notice warn';
+              noteEl.textContent = 'Varredura bloqueada: is_homed != 1. Faça o homing na etapa 3.';
+              return;
+            }
+            bSweep.disabled = true;
+            noteEl.className = 'notice info';
+            noteEl.textContent = 'Varredura em andamento: 0 → curso → 0…';
+            await ensureClosedLoop();
+            await setA('controller.config.input_mode', 6);
+            await setA('controller.config.control_mode', 3);
+            const wait = ms => new Promise(r => { timer = setTimeout(r, ms); });
+            await setA('controller.input_pos', mm2turn(0));            await wait(2500);
+            await setA('controller.input_pos', mm2turn(S.stroke_mm));  await wait(4000);
+            await setA('controller.input_pos', mm2turn(0));            await wait(4000);
+            noteEl.className = 'notice ok';
+            noteEl.textContent = 'Varredura concluída. Clique em "Verificar".';
+            log('varredura 0→' + S.stroke_mm + 'mm→0 concluída');
+            bSweep.disabled = false;
+          } catch (e) {
+            noteEl.className = 'notice warn';
+            noteEl.textContent = 'Varredura falhou: ' + e.message;
+            bSweep.disabled = false;
+          }
+        };
+
+        bStop.onclick = async () => {
+          try {
+            await odrive.reqState(1); // IDLE — para tudo
+            const axErr = await getA('error');
+            log('STOP acionado (state=1, error=' + hexErr(axErr) + ')');
+            noteEl.className = 'notice warn';
+            noteEl.textContent = 'STOP: eixo em IDLE. Malha fechada desligada.';
+          } catch (e) { log('stop falhou: ' + e.message); }
+        };
+
+        bVer.onclick = async () => {
+          try {
+            const st = await getA('current_state');
+            const axErr = await getA('error');
+            const ok = parseInt(st) === 8 && (parseInt(axErr) || 1) === 0;
+            if (ok) {
+              S.stepOk.motiontest = true; S.done.add(id);
+              noteEl.className = 'notice ok';
+              noteEl.textContent = '✓ Movimento ok: eixo em malha fechada sem erros. Pode avançar.';
+              log('motiontest: verificação ok (state=8)');
+            } else {
+              S.stepOk.motiontest = false;
+              noteEl.className = 'notice warn';
+              noteEl.textContent = 'Verificação FALHOU: state=' + st + ' (esperado 8), error=' + hexErr(axErr) + '. Faça um jog antes de verificar.';
+            }
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
+        };
+
+        b.append(noteEl, cv,
+                 grid(field('Passo do jog [mm]', iJog)),
+                 row(bCL, bNeg, bPos, bStop),
+                 row(bSweep, bVer));
+      },
+    });
+  }
+
+  /* ===================== 6. Salvar & CAN ===================== */
+  {
+    const id = 'save';
+
+    const BAUDS = [[125000, '125 k'], [250000, '250 k (padrão)'], [500000, '500 k'], [1000000, '1 M']];
+
+    STEPS.push({
+      id,
+      title: '6. Salvar & CAN',
+      desc: 'Grava os parâmetros em flash, configura o barramento CAN e exporta/importa o perfil.',
+      canFinish() { return S.stepOk.save === true; },
+      body(b) {
+        S.stepOk.save = false;
+        const iNode = num(S.axis, 1, 0);   // EDITÁVEL (era o bug: estava readonly)
+        const iBaud = sel(BAUDS, 250000);
+        const noteEl = note('Configure o node_id do CAN igual à posição do eixo no rig (0..5).', 'info');
+
+        const bApply = btn('Aplicar', 'primary');
+        const bVer = btn('Verificar', 'ok');
+        const bFlash = btn('Salvar em flash + reboot', 'warn');
+
+        const ta = el('textarea'); ta.rows = 6; ta.style.width = '100%';
+        ta.placeholder = 'perfil JSON (exportar/importar)';
+        const bExp = btn('Exportar perfil');
+        const bImp = btn('Importar perfil');
+
+        bApply.onclick = async () => {
+          try {
+            const node = parseInt(iNode.value);
+            if (isNaN(node) || node < 0 || node > 62) throw new Error('node_id deve ser inteiro entre 0 e 62');
+            await setA('can.config.node_id', node);
+            await setA('can.config.baud_rate', +iBaud.value);
+            S.profile.can_node_id = node; S.profile.can_baud_rate = +iBaud.value;
+            S.stepOk.save = false;
+            noteEl.className = 'notice info';
+            noteEl.textContent = 'CAN aplicado (node_id=' + node + ', baud=' + iBaud.value + '). Verifique antes de salvar em flash.';
+            log('can: node_id=' + node + ' baud=' + iBaud.value);
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao aplicar: ' + e.message; }
+        };
+
+        bVer.onclick = async () => {
+          try {
+            const nid = await getA('can.config.node_id');
+            const ok = eq(nid, parseInt(iNode.value), 0.1);
+            if (ok) {
+              S.stepOk.save = true; S.done.add(id);
+              noteEl.className = 'notice ok';
+              noteEl.textContent = '✓ CAN verificado (node_id=' + nid + '). Pode salvar em flash e avançar.';
+              log('can: verificação ok (node_id=' + nid + ')');
+            } else {
+              S.stepOk.save = false;
+              noteEl.className = 'notice warn';
+              noteEl.textContent = 'Verificação FALHOU: node_id relido=' + nid + ', esperado=' + iNode.value + '.';
+            }
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
+        };
+
+        bFlash.onclick = async () => {
+          if (!confirm('Gravar configuração em flash e reiniciar a ODrive? A conexão serial vai cair.')) return;
+          try {
+            bFlash.disabled = true;
+            await odrive.action('save');
+            log('flash: save ok, reiniciando…');
+            await odrive.action('reboot');
+            noteEl.className = 'notice ok';
+            noteEl.textContent = 'Configuração gravada em flash e ODrive reiniciada. Reconecte quando necessário.';
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao salvar: ' + e.message; }
+          bFlash.disabled = false;
+        };
+
+        bExp.onclick = () => {
+          S.profile.axis = S.axis;
+          S.profile.exported_at = new Date().toISOString();
+          ta.value = JSON.stringify(S.profile, null, 2);
+          log('perfil exportado (' + Object.keys(S.profile).length + ' chaves)');
+        };
+
+        bImp.onclick = () => {
+          try {
+            const p = JSON.parse(ta.value);
+            if (typeof p !== 'object' || !p) throw new Error('JSON inválido');
+            if (p.pitch_mm) S.pitch_mm = p.pitch_mm;
+            if (p.stroke_mm) S.stroke_mm = p.stroke_mm;
+            if (p.invert !== undefined) S.invert = !!p.invert;
+            if (p.can_node_id !== undefined) iNode.value = p.can_node_id;
+            if (p.can_baud_rate) iBaud.value = p.can_baud_rate;
+            S.profile = p;
+            log('perfil importado — revise os campos e aplique');
+          } catch (e) { log('import falhou: ' + e.message); }
+        };
+
+        b.append(noteEl,
+                 grid(field('CAN node_id (0–62)', iNode), field('CAN baud rate', iBaud)),
+                 row(bApply, bVer, bFlash),
+                 el('hr'), ta, row(bExp, bImp));
+      },
+    });
+  }
+
+  /* ===================== 7. Monitoramento ===================== */
+  {
+    const id = 'monitor';
+    let cv = null, pollTimer = null, drawTimer = null, table = null;
+
+    function makeTable(axes) {
+      const t = el('table', 'list');
+      t.innerHTML = '<tr><th>Eixo</th><th>Pos [mm]</th><th>Vel [mm/s]</th><th>Iq [A]</th><th>Estado</th><th>Erro</th><th>Vbus [V]</th></tr>';
+      axes.forEach(a => {
+        const tr = t.insertRow();
+        tr.insertCell().textContent = 'M' + a;
+        for (let i = 0; i < 6; i++) tr.insertCell().textContent = '—';
+      });
+      return t;
+    }
+
+    async function pollAll(axes) {
+      const prevAxis = S.axis;
+      try {
+        const vb = await odrive.get('vbus_voltage');
+        for (let k = 0; k < axes.length; k++) {
+          S.axis = axes[k];
+          const tr = table.rows[k + 1];
           try {
             const pos = await getA('encoder.pos_estimate');
-            setStatus(`Posição atual: ${fmt(turn2mm(pos), 2)} mm (${fmt(pos, 3)} turns)`, 'info');
-          } catch (e) { setStatus('Leitura de posição: ' + e.message, 'err'); }
-        };
-
-        cv = el('canvas', 'plot');
-        cv.width = 640; cv.height = 120;
-        odrive.subscribe(50).then(() => { liveTimer = setInterval(() => drawPlot(cv), 50); }).catch(() => {});
-
-        b.append(
-          note('⚠ Eixo em closed-loop e carga livre! Qualquer comando move o atuador imediatamente.', 'warn'),
-          grid(field('Passo do jog [mm]', iStep)),
-          row(bJogM, bJogP, bPos),
-          row(bSweep, bStop),
-          cv,
-          statusLine(),
-        );
-      },
-      onLeave() { sweeping = false; if (liveTimer) { clearInterval(liveTimer); liveTimer = null; } odrive.unsubscribe(); },
-    });
-  }
-
-  /* =====================================================================
-   * 6. SALVAR & CAN — node_id/baud, save+reboot, exportar/importar perfil
-   * ===================================================================== */
-  {
-    let iNode, iBaud, iFile;
-
-    async function applyCan() {
-      const node = Number(iNode.value);
-      if (!(node >= 0 && node <= 63)) { setStatus('node_id deve estar entre 0 e 63.', 'err'); return; }
-      try {
-        await setA('can.config.node_id', node);
-        await setA('can.config.baud_rate', Number(iBaud.value));
-        S.profile.can = { node_id: node, baud_rate: Number(iBaud.value) };
-        setStatus(`CAN configurado: node_id=${node} baud=${Number(iBaud.value) / 1000}k (efetivo após reboot).`, 'ok');
-      } catch (e) { setStatus('CAN: ' + e.message, 'err'); }
-    }
-
-    async function saveFlash() {
-      if (!confirm('Gravar TODA a configuração em flash e reiniciar a ODrive?')) return;
-      try {
-        setStatus('Salvando em flash… (pode levar alguns segundos)', 'warn');
-        await odrive.action('save');
-        setStatus('Salvo! Reiniciando…', 'ok');
-        await odrive.action('reboot').catch(() => {}); // reboot derruba a conexão — erro esperado
-      } catch (e) { setStatus('Salvar: ' + e.message, 'err'); }
-    }
-
-    function exportProfile() {
-      const meta = { exported_at: new Date().toISOString(), serial: S.dev && S.dev.serial ? S.dev.serial : 'unknown', axis: S.axis };
-      const blob = new Blob([JSON.stringify({ meta, profile: S.profile }, null, 2)], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `odrive-profile-${meta.serial}-axis${meta.axis}.json`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-      setStatus('Perfil exportado como JSON.', 'ok');
-    }
-
-    async function importProfile(file) {
-      let data;
-      try { data = JSON.parse(await file.text()); }
-      catch (e) { setStatus('JSON inválido: ' + e.message, 'err'); return; }
-      const p = data.profile || data;
-      const jobs = [];
-      if (p.motor) {
-        jobs.push(['motor.config.motor_type', p.motor.type]);
-        jobs.push(['motor.config.pole_pairs', p.motor.pole_pairs]);
-        jobs.push(['motor.config.current_lim', p.motor.current_lim]);
-        jobs.push(['motor.config.phase_resistance', p.motor.R]);
-        jobs.push(['motor.config.phase_inductance', p.motor.L]);
-      }
-      if (p.tuning) {
-        jobs.push(['controller.config.pos_gain', p.tuning.pos_gain]);
-        jobs.push(['controller.config.vel_gain', p.tuning.vel_gain]);
-        jobs.push(['controller.config.vel_integrator_gain', p.tuning.vel_integrator_gain]);
-      }
-      if (p.homing && p.homing.mode === 'stall_current') {
-        jobs.push(['min_endstop.config.enabled', 0]);
-        if (p.homing.iq_thres != null) jobs.push(['stall_homing.config.iq_thres', p.homing.iq_thres]);
-        if (p.homing.vel != null) jobs.push(['stall_homing.config.vel', p.homing.vel]);
-      }
-      let ok = 0, fail = 0;
-      for (const [path, val] of jobs) {
-        if (val == null) continue;
-        try { await setA(path, val); ok++; }
-        catch (e) { fail++; log(`Import: FALHOU ${path} = ${val} — ${e.message}`); }
-      }
-      Object.assign(S.profile, p);
-      setStatus(`Importado: ${ok} parâmetros aplicados, ${fail} falharam (veja o log).`, fail ? 'warn' : 'ok');
-    }
-
-    STEPS.push({
-      id: 'save', title: '6. Salvar & CAN', desc: 'Configuração CAN, gravação em flash com reboot e exportação/importação do perfil.',
-      async body(b) {
-        let curNode = 0;
-        try { curNode = await getA('can.config.node_id'); } catch (_) {}
-        iNode = num(curNode || 0, 1, 0); iNode.max = 63;
-        iBaud = sel([[250000, '250 kbit/s'], [125000, '125 kbit/s'], [500000, '500 kbit/s'], [1000000, '1 Mbit/s']], 250000);
-        const bApplyCan = btn('Aplicar CAN'); bApplyCan.onclick = applyCan;
-        const bSave = btn('Salvar configuração em flash', 'primary'); bSave.onclick = saveFlash;
-        const bExp = btn('Exportar perfil JSON'); bExp.onclick = exportProfile;
-        iFile = document.createElement('input'); iFile.type = 'file'; iFile.accept = '.json,application/json';
-        iFile.onchange = () => { if (iFile.files[0]) importProfile(iFile.files[0]); };
-        const bImp = btn('Importar perfil…'); bImp.onclick = () => iFile.click();
-
-        b.append(
-          note('A configuração em RAM é perdida no reboot — salve em flash antes de desligar.', 'warn'),
-          grid(
-            field('CAN node_id (0–63)', iNode),
-            field('CAN baud rate', iBaud),
-          ),
-          row(bApplyCan, bSave),
-          note('Backup do perfil (motor, atuador, tuning, homing) em arquivo JSON.', 'info'),
-          row(bExp, bImp),
-          iFile,
-          statusLine(),
-        );
-        iFile.style.display = 'none';
-      },
-    });
-  }
-
-  /* =====================================================================
-   * 7. MONITORAMENTO — dashboard multi-eixo em tempo real + reboot/home
-   * ===================================================================== */
-  {
-    let timer = null;
-    let cv, plotTimer = null;
-    let cellsRoot;
-
-    const STATE_NAMES = { 0: 'UNDEFINED', 1: 'IDLE', 2: 'STARTUP', 3: 'FULL_CALIB', 4: 'MOTOR_CALIB', 5: 'ENC_INDEX', 6: 'HOMING', 7: 'ENC_OFFSET', 8: 'CLOSED_LOOP' };
-
-    function makeCard(n) {
-      const card = el('div', 'mon-card');
-      card.style.cssText = 'border:1px solid #333;border-radius:6px;padding:8px;min-width:170px';
-      const title = el('div'); title.style.fontWeight = 'bold'; title.textContent = `axis${n}`;
-      const pos = el('div'), vel = el('div'), iq = el('div'), st = el('div'), err = el('div');
-      card.append(title, pos, vel, iq, st, err);
-      return { card, pos, vel, iq, st, err };
-    }
-
-    async function pollOnce(cards) {
-      for (const { n, c } of cards) {
-        try {
-          // WebSerialTransport: subscribe já faz polling; getA/get devolvem os últimos valores.
-          // WSTransport (ESP32 :81): get por caminho completo 'axisN.<prop>'.
-          const p = (prop) => n === Number(S.axis) ? getA(prop) : odrive.get(`axis${n}.${prop}`);
-          const [pos, vel, iq, st, err] = await Promise.all([
-            p('encoder.pos_estimate'), p('encoder.vel_estimate'), p('motor.current_control.Iq_measured'),
-            p('current_state'), p('error'),
-          ]);
-          c.pos.textContent = `Posição: ${fmt(turn2mm(pos), 2)} mm`;
-          c.vel.textContent = `Velocidade: ${fmt(turn2mm(vel), 1)} mm/s`;
-          c.iq.textContent = `Iq: ${fmt(iq, 2)} A`;
-          c.st.textContent = `Estado: ${STATE_NAMES[Number(st)] || st}`;
-          c.err.textContent = `Erro: 0x${Number(err || 0).toString(16)}`;
-          c.err.style.color = Number(err) ? '#e5534b' : '#57ab5a';
-        } catch (e) {
-          c.st.textContent = `sem resposta (${e.message})`;
-        }
-      }
-      try {
-        const vbus = await odrive.get('vbus_voltage');
-        const elV = document.getElementById('mon-vbus');
-        if (elV) elV.textContent = `Vbus: ${fmt(vbus, 2)} V`;
-      } catch (_) {}
-    }
-
-    STEPS.push({
-      id: 'monitor', title: '7. Monitoramento', desc: 'Dashboard em tempo real de todos os eixos configurados: posição, velocidade, corrente, estado e erros.',
-      body(b) {
-        const axes = (Array.isArray(S.axesList) && S.axesList.length ? S.axesList : [Number(S.axis || 0)]);
-        cellsRoot = el('div');
-        cellsRoot.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px';
-        const cards = axes.map(n => { const c = makeCard(n); cellsRoot.append(c.card); return { n, c }; });
-
-        const vbus = note('Vbus: --', 'info'); vbus.id = 'mon-vbus';
-
-        cv = el('canvas', 'plot');
-        cv.width = 640; cv.height = 120;
-
-        const bHomeAll = btn('Reboot & Home em todos', 'err');
-        bHomeAll.onclick = async () => {
-          if (!confirm('Enviar HOMING (estado 6) para TODOS os eixos? Todos vão se mover até seus limites!')) return;
-          for (const n of axes) {
-            try {
-              if (n === Number(S.axis)) await odrive.reqState(AXIS.HOMING);
-              else await odrive.set(`axis${n}.requested_state`, AXIS.HOMING);
-              log(`Homing solicitado em axis${n}`);
-            } catch (e) { log(`axis${n}: falha no homing — ${e.message}`); }
+            const vel = await getA('encoder.vel_estimate');
+            const iq  = await getA('motor.Iq_measured');
+            const st  = await getA('current_state');
+            const err = await getA('error');
+            tr.cells[1].textContent = pos === null ? '—' : fmt(turn2mm(pos), 1);
+            tr.cells[2].textContent = vel === null ? '—' : fmt(turn2mm(vel), 1);
+            tr.cells[3].textContent = iq === null ? '—' : fmt(iq, 2);
+            tr.cells[4].textContent = st === null ? '—' : String(st);
+            tr.cells[5].textContent = hexErr(err);
+            tr.cells[5].className = (parseInt(err) || 0) !== 0 ? 'err' : '';
+            tr.cells[6].textContent = vb === null ? '—' : fmt(vb, 1);
+          } catch (e) {
+            tr.cells[1].textContent = 'erro';
           }
-          setStatus('Homing disparado em todos os eixos — acompanhe o dashboard.', 'warn');
+        }
+      } finally {
+        S.axis = prevAxis;
+      }
+    }
+
+    const onTelMon = () => { if (cv) drawPlot(cv); };
+
+    STEPS.push({
+      id,
+      title: '7. Monitoramento',
+      desc: 'Acompanhamento contínuo de todos os eixos do rig. Sem bloqueio de avanço.',
+      // sem gating
+      body(b) {
+        const axes = S.axesList && S.axesList.length ? S.axesList : [S.axis];
+        table = makeTable(axes);
+        cv = el('canvas', 'plot');
+        cv.style.width = '100%'; cv.style.height = '160px';
+
+        S.onTelemetry = onTelMon;
+        odrive.subscribe(200);
+        pollTimer = setInterval(() => pollAll(axes), 200);
+        drawTimer = setInterval(() => { if (cv) drawPlot(cv); }, 200);
+
+        const bHomeAll = btn('Reboot & Home em todos', 'warn');
+        bHomeAll.onclick = async () => {
+          if (!confirm('Reiniciar e executar homing em TODOS os eixos do rig?')) return;
+          const prev = S.axis;
+          try {
+            for (const a of axes) {
+              S.axis = a;
+              log('monitor: reboot eixo M' + a + '…');
+              try { await odrive.action('reboot'); } catch (e) { log('reboot M' + a + ': ' + e.message); }
+            }
+            await new Promise(r => setTimeout(r, 3000));
+            for (const a of axes) {
+              S.axis = a;
+              log('monitor: homing eixo M' + a + '…');
+              try {
+                await odrive.reqState(6);
+                await pollUntil('current_state', s => parseInt(s) === 1, 60000, 400);
+                const err = await getA('error');
+                log('monitor: M' + a + ' homing fim, error=' + hexErr(err));
+              } catch (e) { log('homing M' + a + ' falhou: ' + e.message); }
+            }
+          } finally { S.axis = prev; }
         };
 
-        odrive.subscribe(200).catch(() => {});
-        timer = setInterval(() => pollOnce(cards), 200);
-        plotTimer = setInterval(() => drawPlot(cv), 200);
-        pollOnce(cards);
-
-        b.append(
-          note(`Monitorando eixos: ${axes.map(n => 'axis' + n).join(', ')} — atualização a cada 200 ms.`, 'info'),
-          vbus,
-          cellsRoot,
-          cv,
-          row(bHomeAll),
-          statusLine(),
-        );
+        b.append(note('Leitura a cada 200 ms. Erros são flags físicas da ODrive (hex).', 'info'),
+                 table, cv, row(bHomeAll));
       },
       onLeave() {
-        if (timer) { clearInterval(timer); timer = null; }
-        if (plotTimer) { clearInterval(plotTimer); plotTimer = null; }
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        if (drawTimer) { clearInterval(drawTimer); drawTimer = null; }
+        if (S.onTelemetry === onTelMon) S.onTelemetry = null;
         odrive.unsubscribe();
       },
     });
