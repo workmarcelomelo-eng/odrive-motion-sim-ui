@@ -309,7 +309,7 @@
         bApply.onclick = async () => {
           try {
             const isEnd = modeSel.value === 'endstop';
-            await setA('controller.config.homing_mode', isEnd ? 1 : 2); // 1=endstop, 2=stall (fw custom)
+            await setA('controller.config.homing_mode', isEnd ? 0 : 1); // 0=ENDSTOP (nativo), 1=STALL_CURRENT (mod do firmware)
             if (isEnd) {
               await setA('min_endstop.config.gpio_num', +eGpio.value);
               await setA('min_endstop.config.is_active_high', +eHigh.value === 1);
@@ -631,8 +631,8 @@
           try {
             const node = parseInt(iNode.value);
             if (isNaN(node) || node < 0 || node > 62) throw new Error('node_id deve ser inteiro entre 0 e 62');
-            await setA('can.config.node_id', node);
-            await setA('can.config.baud_rate', +iBaud.value);
+            await odrive.set(axP('config.can.node_id'), node);     // node_id é por-eixo
+            await odrive.set('can.config.baud_rate', +iBaud.value); // baud é do dispositivo (raiz)
             S.profile.can_node_id = node; S.profile.can_baud_rate = +iBaud.value;
             S.stepOk.save = false;
             noteEl.className = 'notice info';
@@ -643,7 +643,7 @@
 
         bVer.onclick = async () => {
           try {
-            const nid = await getA('can.config.node_id');
+            const nid = await getA('config.can.node_id');
             const ok = eq(nid, parseInt(iNode.value), 0.1);
             if (ok) {
               S.stepOk.save = true; S.done.add(id);
