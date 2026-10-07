@@ -18,13 +18,15 @@ class WSTransport {
   constructor(url) {
     // ESP32 serve a UI na porta 80 e o WS na 81; em dev a UI é servida em :8080 e a bridge (bridge.py/mock) em :8765.
     if (!url) url = (location.port === '' || location.port === '80') ? `ws://${location.hostname}:81/` : 'ws://127.0.0.1:8765/';
-    this.url = url; this.seq = 1; this.pending = new Map(); this.onstate = null; this.onevent = null;
+    this.url = url; this.seq = 1; this.pending = new Map(); this.onstate = null; this.onevent = null; this._wsReconnectOn = false;
   }
+  get connected() { return !!(this.ws && this.ws.readyState === 1); }
   connect() {
+    this._wsReconnectOn = true;
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.url);
       this.ws.onopen = () => { resolve(); };
-      this.ws.onclose = () => { onConn(false); this.onstate && this.onstate(false); };
+      this.ws.onclose = () => { onConn(false); this.onstate && this.onstate(false); this._wsAutoReconnect(); };
       this.ws.onerror = e => reject(e);
       this.ws.onmessage = ev => {
         const m = JSON.parse(ev.data);
@@ -35,9 +37,17 @@ class WSTransport {
       };
     });
   }
+  async _wsAutoReconnect() {
+    if (!this._wsReconnectOn) return;
+    while (this._wsReconnectOn && !this.connected) {
+      await new Promise(r => setTimeout(r, 2000));
+      try { await this.connect(); break; } catch (e) { /* tenta de novo */ }
+    }
+  }
   call(cmd, payload = {}) {
     const id = this.seq++;
     return new Promise((res, rej) => {
+      if (!this.connected) return rej(new Error('não conectado'));
       this.pending.set(id, { res, rej });
       setTimeout(() => { if (this.pending.delete(id)) rej(new Error('timeout')); }, 10000);
       this.ws.send(JSON.stringify({ id, cmd, ...payload }));
@@ -84,7 +94,31 @@ class WebSerialTransport {
       }
     } catch (e) {} this._close();
   }
-  _close() { onConn(false); this.onstate && this.onstate(false); }
+  _close() { onConn(false); this.onstate && this.onstate(false); this._autoReconnect(); }
+  // Reconexão automática: reabre a mesma porta (após reboot/erase a ODrive volta com o mesmo USB).
+  async _autoReconnect() {
+    if (this._reconnOn) return; this._reconnOn = true;
+    let tries = 0;
+    while (this._reconnOn && tries++ < 60 && !this.connected) {
+      try {
+        if (!this.port) {
+          const ports = await navigator.serial.getPorts();
+          if (ports.length) this.port = ports[0]; else { await new Promise(r => setTimeout(r, 1500)); continue; }
+        }
+        try { await this.port.close(); } catch (e) {}
+        await new Promise(r => setTimeout(r, 1500));
+        await this.port.open({ baudRate: this.baud, dataBits: 8, stopBits: 1, parity: 'none' });
+        this.td = new TextDecoderStream(); this.port.readable.pipeTo(this.td.writable).catch(() => {});
+        this.stream = this.td.readable; this.reader = this.stream.getReader();
+        this._readLoop();
+        onConn(true); this.onstate && this.onstate(true);
+        if (typeof window !== 'undefined' && window._core && window._core.S && window._core.S.onReconnected) window._core.S.onReconnected();
+        return;
+      } catch (e) { await new Promise(r => setTimeout(r, 1500)); }
+    }
+    this._reconnOn = false;
+  }
+  stopAutoReconnect() { this._reconnOn = false; }
   get connected() { return !!(this.port && this.port.writable); }
   _send(line) { if (!this.connected) return; const w = this.port.writable.getWriter(); const te = new TextEncoder(); w.write(te.encode(line + '\n')).finally(() => w.releaseLock()); }
   // serialização de requisições (a ODrive processa uma linha por vez)
@@ -104,6 +138,16 @@ class WebSerialTransport {
     return this._q(async () => { this._send(m[name] || name); await new Promise(r => setTimeout(r, 50)); });
   }
   scan() { return Promise.resolve([{ serial: 'USB-serial', hw_major: 3, hw_minor: 6, fw: '0.5.6-sh' }]); }
+  // Sincroniza campos do wizard a partir da placa (chamada automática na (re)conexão)
+  async syncFromDevice(paths) {
+    const out = {};
+    for (const [key, path] of Object.entries(paths)) {
+      const v = await this.get(path);
+      if (v !== null && v !== undefined) out[key] = v;
+      await new Promise(r => setTimeout(r, 30));
+    }
+    return out;
+  }
   subscribe(period = 50) {
     this.unsubscribe();
     if (!this.connected) return Promise.resolve();
@@ -309,20 +353,30 @@ const STEPS = [];
 /* ---- 1...7 preenchidas em seguida ---- */
 
 /* ===================== App ===================== */
+/* Persistência local (localStorage) dos campos do wizard por etapa — sobrevive a troca de tela/boot/reload */
+const LS_KEY = 'odms-wizard-v1';
+const lsLoad = () => { try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}'); } catch { return {}; } };
+const lsSet = (k, v) => { const o = lsLoad(); o[k] = v; try { localStorage.setItem(LS_KEY, JSON.stringify(o)); } catch {} };
+
 const app = {
   cur: 0,
-  finish(id) { S.done.add(id); this.cur = Math.min(this.cur + 1, STEPS.length - 1); this.render(); },
+  _prevStep: null,
+  finish(id) { const s = STEPS[this.cur]; if (s && s.canFinish && !s.canFinish()) { return; } S.done.add(id); this.cur = Math.min(this.cur + 1, STEPS.length - 1); this.render(); },
   goto(i) { this.cur = i; this.render(); },
   render() {
+    // onLeave da etapa anterior (adesão de timers/telemetria)
+    if (this._prevStep && this._prevStep.onLeave) { try { this._prevStep.onLeave(); } catch (e) {} }
+    const s = STEPS[this.cur];
+    this._prevStep = s;
+
     const nav = document.getElementById('steps');
     nav.innerHTML = '';
-    STEPS.forEach((s, i) => {
-      const it = el('div', 'item' + (i === this.cur ? ' active' : '') + (S.done.has(s.id) ? ' done' : ''));
-      it.append(el('span', 'n', S.done.has(s.id) ? '✓' : String(i)), el('span', null, s.title));
+    STEPS.forEach((st, i) => {
+      const it = el('div', 'item' + (i === this.cur ? ' active' : '') + (S.done.has(st.id) ? ' done' : ''));
+      it.append(el('span', 'n', S.done.has(st.id) ? '✓' : String(i)), el('span', null, st.title));
       it.onclick = () => this.goto(i);
       nav.append(it);
     });
-    const s = STEPS[this.cur];
     const page = document.getElementById('page');
     page.innerHTML = '';
     const tpl = document.getElementById('tpl-step').content.cloneNode(true);
@@ -331,17 +385,36 @@ const app = {
     const bodyEl = tpl.querySelector('.body');
     logbox = el('div', 'log'); logbox.textContent = '';
     s.body(bodyEl);
+
+    // Restaura valores salvos e persiste novas edições (mesmo entre troca de etapas)
+    const saved = lsLoad();
+    bodyEl.querySelectorAll('input, select').forEach((inp, i) => {
+      const k = s.id + ':' + i;
+      if (saved[k] !== undefined) { if (inp.type === 'checkbox') inp.checked = !!saved[k]; else inp.value = saved[k]; }
+      inp.addEventListener('input', () => lsSet(k, inp.type === 'checkbox' ? inp.checked : inp.value));
+    });
+
     bodyEl.append(logbox);
     tpl.querySelector('.prev').style.display = this.cur === 0 ? 'none' : '';
     tpl.querySelector('.next').style.display = this.cur === STEPS.length - 1 ? 'none' : '';
     tpl.querySelector('.prev').onclick = () => this.goto(this.cur - 1);
     tpl.querySelector('.next').onclick = () => app.finish(s.id);
     page.append(tpl);
+
+    // Leitura automática da ODrive quando conectada: dispara o "Verificar" da etapa automaticamente
+    if (odrive.connected) {
+      const bVer = [...bodyEl.querySelectorAll('button')].find(x => x.textContent.trim() === 'Verificar');
+      if (bVer) bVer.click();
+    }
+    if (s.onEnter) { try { s.onEnter(); } catch (e) {} }
+    onConn(odrive.connected || !!(odrive.ws && odrive.ws.readyState === 1));
   },
 };
 function onConn(on) {
   const h = document.getElementById('hdr-status');
   h.className = 'badge ' + (on ? 'on' : 'off'); h.textContent = on ? 'online' : 'offline';
+  // Ao reconectar (reboot/erase da ODrive), re-renderiza a etapa atual — dispara o "Verificar" automático
+  if (on) { try { app.render(); } catch (e) {} }
 }
 odrive.onstate = onConn;
 
