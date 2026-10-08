@@ -384,13 +384,28 @@ const app = {
     tpl.querySelector('.desc').textContent = s.desc;
     const bodyEl = tpl.querySelector('.body');
     logbox = el('div', 'log'); logbox.textContent = '';
-    s.body(bodyEl);
+
+    // Se a etapa falhar internamente, mostra o erro em vez de tela em branco
+    let renderErr = null;
+    try { s.body(bodyEl); }
+    catch (e) { renderErr = e; }
+    if (renderErr) {
+      const n = el('div', 'notice err', 'Erro interno nesta etapa: <b>' + (renderErr && renderErr.message) + '</b><br><small>' + (renderErr && renderErr.stack || '') + '</small>');
+      bodyEl.append(n);
+      console.error(renderErr);
+    }
 
     // Restaura valores salvos e persiste novas edições (mesmo entre troca de etapas)
     const saved = lsLoad();
     bodyEl.querySelectorAll('input, select').forEach((inp, i) => {
       const k = s.id + ':' + i;
-      if (saved[k] !== undefined) { if (inp.type === 'checkbox') inp.checked = !!saved[k]; else inp.value = saved[k]; }
+      if (saved[k] !== undefined) {
+        try {
+          if (inp.type === 'checkbox') inp.checked = !!saved[k];
+          else if (typeof saved[k] === 'object') inp.value = JSON.stringify(saved[k]);
+          else inp.value = saved[k];
+        } catch (e) { /* ignora dados de formato antigo */ }
+      }
       inp.addEventListener('input', () => lsSet(k, inp.type === 'checkbox' ? inp.checked : inp.value));
     });
 
@@ -407,14 +422,22 @@ const app = {
       if (bVer) bVer.click();
     }
     if (s.onEnter) { try { s.onEnter(); } catch (e) {} }
-    onConn(odrive.connected || !!(odrive.ws && odrive.ws.readyState === 1));
+    // badge: só atualiza se mudou (render não deve chamar onConn(true) para não recursar)
+    try {
+      const on = odrive.connected || !!(odrive.ws && odrive.ws.readyState === 1);
+      _connWas = on; // marca estado p/ onConn não re-disparar render
+      const h = document.getElementById('hdr-status');
+      h.className = 'badge ' + (on ? 'on' : 'off'); h.textContent = on ? 'online' : 'offline';
+    } catch (e) {}
   },
 };
+let _connWas = false;
 function onConn(on) {
   const h = document.getElementById('hdr-status');
   h.className = 'badge ' + (on ? 'on' : 'off'); h.textContent = on ? 'online' : 'offline';
-  // Ao reconectar (reboot/erase da ODrive), re-renderiza a etapa atual — dispara o "Verificar" automático
-  if (on) { try { app.render(); } catch (e) {} }
+  // re-renderiza SÓ na transição offline→online (evita loop render→onConn→render)
+  if (on && !_connWas) { try { app.render(); } catch (e) {} }
+  _connWas = !!on;
 }
 odrive.onstate = onConn;
 
