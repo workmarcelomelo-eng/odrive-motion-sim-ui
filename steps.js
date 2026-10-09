@@ -145,7 +145,66 @@
     });
   }
 
-  /* ===================== 1. Motor ===================== */
+  /* ===================== 1. Fonte de alimentação ===================== */
+  {
+    const id = 'power';
+
+    STEPS.push({
+      id,
+      title: '1. Fonte de alimentação',
+      desc: 'Limites elétricos da fonte e resistor de frenagem — evita sobretensão/subtensão.',
+      canFinish() { return S.stepOk.power === true; },
+      body(b) {
+        S.stepOk.power = false;
+        const iUv = num(8, 0.5, 1),
+              iOv = num(56, 0.5, 1),
+              iBrEn = sel([[1, 'Ativado'], [0, 'Desativado']], 0),
+              iBrR  = num(2.0, 0.1, 0.05);
+        const noteEl = note('Defina os Limites da fonte e o resistor de frenagem antes de ligar o motor.', 'info');
+        const bApply = btn('Aplicar', 'primary');
+        const bVer = btn('Verificar', 'ok');
+
+        bApply.onclick = async () => {
+          try {
+            await odrive.set('config.dc_bus_undervoltage_trip_level', +iUv.value);
+            await odrive.set('config.dc_bus_overvoltage_trip_level', +iOv.value);
+            await odrive.set('config.enable_brake_resistor', +iBrEn.value);
+            await odrive.set('config.brake_resistance', +iBrR.value);
+            Object.assign(S.profile, { dc_uv: +iUv.value, dc_ov: +iOv.value, brake_en: +iBrEn.value, brake_r: +iBrR.value });
+            noteEl.className = 'notice info';
+            noteEl.textContent = 'Fonte aplicada (' + iUv.value + 'V–' + iOv.value + 'V, freio=' + (iBrEn.value === '1' ? iBrR.value + 'Ω' : 'off') + '). Clique em "Verificar".';
+            log('power: aplicados uv=' + iUv.value + ' ov=' + iOv.value + ' brake=' + iBrEn.value + ' (' + iBrR.value + 'Ω)');
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao aplicar: ' + e.message; }
+        };
+
+        bVer.onclick = async () => {
+          try {
+            const uv = await odrive.get('config.dc_bus_undervoltage_trip_level');
+            const ov = await odrive.get('config.dc_bus_overvoltage_trip_level');
+            const bre = await odrive.get('config.enable_brake_resistor');
+            const brr = await odrive.get('config.brake_resistance');
+            const ok = eq(uv, iUv.value, 0.5) && eq(ov, iOv.value, 0.5) && eq(bre, iBrEn.value, 0.1) && (+iBrEn.value === 0 || eq(brr, iBrR.value, 0.05));
+            if (ok) {
+              S.stepOk.power = true; S.done.add(id);
+              noteEl.className = 'notice ok';
+              noteEl.textContent = '✓ Fonte verificada na ODrive. Pode avançar.';
+            } else {
+              S.stepOk.power = false;
+              noteEl.className = 'notice warn';
+              noteEl.textContent = 'Verificação FALHOU: lido uv=' + uv + ' ov=' + ov + ' brake=' + bre + ' R=' + brr;
+            }
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
+        };
+
+        b.append(noteEl,
+                 grid(field('Tensão mínima [V]', iUv), field('Tensão máxima [V]', iOv),
+                      field('Resistor de frenagem', iBrEn), field('Resistência do freio [Ω]', iBrR)),
+                 row(bApply, bVer));
+      },
+    });
+  }
+
+  /* ===================== 2. Motor ===================== */
   {
     const id = 'motor';
     let iType, iPoles, iIlim, iIcal, iVcal, oR, oL, noteEl;
@@ -153,39 +212,57 @@
 
     STEPS.push({
       id,
-      title: '1. Motor',
-      desc: 'Parâmetros elétricos do motor e medição de resistência/indutância de fase (R & L).',
+      title: '2. Motor',
+      desc: 'Eletromecânica do motor (datasheet), segurança de velocidade/torque e calibração de resistência/indutância.',
       canFinish() { return S.stepOk.motor === true; },
       body(b) {
         S.stepOk.motor = false; measured = false;
+
         iType = sel([[0, 'HIGH_CURRENT (0)'], [2, 'GIMBAL (2)']], 0);
         iPoles = num(7, 1, 1);
-        iIlim  = num(20, 0.5, 0);
-        iIcal  = num(10, 0.5, 0);
+        const iTorqueK = num(8.27, 0.01, 0.01);           // torque_constant (Nm/A). ex.: 8.27/KV velho
+        const iCtrl = sel([[1, 'TORQUE'], [3, 'POSITION']], 1);          // default seguido do direct-drive/D.D.
+        const iBand = num(200, 10, 10);                   // current_control_bandwidth (Hz) — reduzido p/ motores grandes
+        // Flags de proteção (marcado = habilitado = 1 na placa)
+        const iNoVelLim = el('input'); iNoVelLim.type = 'checkbox';   // enable_vel_limit
+        const iNoVelTrq = el('input'); iNoVelTrq.type = 'checkbox';   // enable_torque_mode_vel_limit
+        const iNoOvers = el('input'); iNoOvers.type = 'checkbox';     // enable_overspeed_error
+        iNoVelLim.checked = true; iNoVelTrq.checked = true; iNoOvers.checked = true;
+
+        iIlim  = num(12, 0.5, 0);
+        iIcal  = num(4, 0.5, 0);
         iVcal  = num(4, 0.5, 0);
         oR = num(); oR.readOnly = true; oR.value = '';
         oL = num(); oL.readOnly = true; oL.value = '';
-        noteEl = note('1) Aplique os parâmetros. 2) Meça R & L. 3) Verifique.', 'info');
+        noteEl = note('1) Aplique os parâmetros. 2) Calibre o motor (Medir R & L). 3) Verifique. Ajuste a tensão de calibração incrementalmente (2/4/6/8/10V) em caso de falha.', 'info');
 
         const bApply = btn('Aplicar', 'primary');
-        const bMeas  = btn('Medir R & L');
+        const bMeas  = btn('Medir R & L (calibrar motor)');
         const bVer   = btn('Verificar', 'ok');
 
         bApply.onclick = async () => {
           try {
             await setA('motor.config.motor_type', +iType.value);
             await setA('motor.config.pole_pairs', +iPoles.value);
+            await setA('motor.config.torque_constant', +iTorqueK.value);
             await setA('motor.config.current_lim', +iIlim.value);
+            await setA('motor.config.current_control_bandwidth', +iBand.value);
             await setA('motor.config.calibration_current', +iIcal.value);
             await setA('motor.config.resistance_calib_max_voltage', +iVcal.value);
+            await setA('controller.config.control_mode', +iCtrl.value);
+            await setA('controller.config.enable_vel_limit', iNoVelLim.checked ? 1 : 0);
+            await setA('controller.config.enable_torque_mode_vel_limit', iNoVelTrq.checked ? 1 : 0);
+            await setA('controller.config.enable_overspeed_error', iNoOvers.checked ? 1 : 0);
             Object.assign(S.profile, {
-              motor_type: +iType.value, pole_pairs: +iPoles.value,
-              current_lim: +iIlim.value, calibration_current: +iIcal.value,
-              resistance_calib_max_voltage: +iVcal.value,
+              motor_type: +iType.value, pole_pairs: +iPoles.value, torque_constant: +iTorqueK.value,
+              control_mode: +iCtrl.value, current_lim: +iIlim.value, calibration_current: +iIcal.value,
+              resistance_calib_max_voltage: +iVcal.value, current_control_bandwidth: +iBand.value,
+              enable_vel_limit: iNoVelLim.checked, enable_torque_mode_vel_limit: iNoVelTrq.checked,
+              enable_overspeed_error: iNoOvers.checked,
             });
             noteEl.className = 'notice info';
-            noteEl.textContent = 'Parâmetros do motor aplicados. Agora clique em "Medir R & L".';
-            log('motor: parâmetros aplicados (type=' + iType.value + ', poles=' + iPoles.value + ', Ilim=' + iIlim.value + ')');
+            noteEl.textContent = 'Parâmetros aplicados (lim. veloc. em torque: torque=N, position=K). Agora clique em "Medir R & L".';
+            log('motor aplicado, torqueK=' + iTorqueK.value + ' ccm=' + iCtrl.value);
           } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao aplicar: ' + e.message; log('motor apply falhou: ' + e.message); }
         };
 
@@ -247,77 +324,135 @@
 
         b.append(noteEl,
                  grid(field('Tipo de motor', iType), field('Pole pairs', iPoles),
-                      field('Limite de corrente [A]', iIlim), field('Corrente de calibração [A]', iIcal),
-                      field('Tensão máx. calib. R [V]', iVcal)),
+                      field('Torque constant [Nm/A]', iTorqueK), field('Modo de controle', iCtrl)),
+                 grid(field('Limite de corrente [A]', iIlim), field('Banda corrente [Hz]', iBand),
+                      field('Corrente de calibração [A]', iIcal), field('Tensão máx. calib. R [V]', iVcal)),
+                 grid(field('Lim. de vel. geral', iNoVelLim), field('Lim. de vel. (torque)', iNoVelTrq),
+                      field('Erro de sobrevel.', iNoOvers)),
                  grid(field('Resistência de fase [Ω]', oR), field('Indutância de fase [H]', oL)),
                  row(bApply, bMeas, bVer));
       },
     });
   }
 
-  /* ===================== 2. Atuador (fuso) ===================== */
+  /* ===================== 3. Encoder & Geometria ===================== */
   {
-    const id = 'actuator';
+    const id = 'encoder';
 
     STEPS.push({
       id,
-      title: '2. Atuador (fuso)',
-      desc: 'Geometria do fuso de esferas e limites derivados no controlador.',
-      canFinish() { return S.stepOk.actuator === true; },
+      title: '3. Encoder & Atuador',
+      desc: 'Sensor de posição (incremental ABZ), índice Z + calibração, e geometria do fuso (mm↔voltas).',
+      canFinish() { return S.stepOk.encoder === true; },
       body(b) {
-        S.stepOk.actuator = false;
+        S.stepOk.encoder = false;
+        const iMode = sel([[0, 'Incremental ABZ']], 0);            // encoder.config.mode=0 (fixo)
+        const iCpr = num(10000, 1, 16);
+        const iBand = num(1000, 10, 10);
+        const iIdx = sel([[1, 'Sim (busca o índice Z no boot)'], [0, 'Não — calibra offset toda vez']], 0);
+        const iPre = sel([[1, 'Pre-calibrado (não recalibra no boot)'], [0, 'Recalibra no boot']], 0);
+
+        // geometria do fuso (mm↔turn)
         const iPitch = num(S.pitch_mm, 0.5, 0.1);
         const iStroke = num(S.stroke_mm, 1, 1);
         const iInv = sel([[0, 'Normal'], [1, 'Invertido']], S.invert ? 1 : 0);
-        const iCpr = num(8192, 1, 1);
-        const noteEl = note('Passo e curso definem o vel_limit e os fatores mm↔voltas.', 'info');
 
+        // flags de boot (startup)
+        const iSuMo = el('input'); iSuMo.type = 'checkbox';
+        const iSuIx = el('input'); iSuIx.type = 'checkbox';
+        const iSuEc = el('input'); iSuEc.type = 'checkbox';
+        const iSuCl = el('input'); iSuCl.type = 'checkbox';
+        const iSuHm = el('input'); iSuHm.type = 'checkbox'; iSuHm.checked = true;
+
+        const noteEl = note('Aplique os parâmetros, calibre o encoder (o eixo gira levemente) e verifique.', 'info');
         const bApply = btn('Aplicar', 'primary');
+        const bCal  = btn('Calibrar encoder (offset)');
+        const bIndex = btn('Buscar índice Z');
         const bVer = btn('Verificar', 'ok');
 
-        const velLim = () => Math.max(1, Math.round((+iStroke.value / +iPitch.value) * 2)); // 2x o curso em voltas/s (razoável p/ fuso)
+        const velLim = () => Math.max(1, Math.round((+iStroke.value / +iPitch.value) * 2));
 
         bApply.onclick = async () => {
           try {
             S.pitch_mm = +iPitch.value; S.stroke_mm = +iStroke.value; S.invert = (+iInv.value === 1);
+            await setA('encoder.config.mode', 0);
             await setA('encoder.config.cpr', +iCpr.value);
+            await setA('encoder.config.bandwidth', +iBand.value);
+            await setA('encoder.config.use_index', +iIdx.value === 1 ? 1 : 0);
+            await setA('encoder.config.pre_calibrated', +iPre.value === 1 ? 1 : 0);
+            await setA('config.startup_motor_calibration', iSuMo.checked ? 1 : 0);
+            await setA('config.startup_encoder_index_search', iSuIx.checked ? 1 : 0);
+            await setA('config.startup_encoder_offset_calibration', iSuEc.checked ? 1 : 0);
+            await setA('config.startup_closed_loop_control', iSuCl.checked ? 1 : 0);
+            await setA('config.startup_homing', iSuHm.checked ? 1 : 0);
             await setA('controller.config.vel_limit', velLim());
             await setA('controller.config.pos_gain', 20);
             await setA('controller.config.vel_gain', 0.16);
             Object.assign(S.profile, {
-              pitch_mm: S.pitch_mm, stroke_mm: S.stroke_mm, invert: S.invert,
-              encoder_cpr: +iCpr.value, vel_limit: velLim(), pos_gain: 20, vel_gain: 0.16,
+              encoder_cpr: +iCpr.value, encoder_bandwidth: +iBand.value, use_index: +iIdx.value === 1,
+              pre_calibrated: +iPre.value === 1, pitch_mm: S.pitch_mm, stroke_mm: S.stroke_mm, invert: S.invert,
+              vel_limit: velLim(), startup_motor_calibration: iSuMo.checked, startup_encoder_index_search: iSuIx.checked,
+              startup_encoder_offset_calibration: iSuEc.checked, startup_closed_loop_control: iSuCl.checked, startup_homing: iSuHm.checked,
             });
             noteEl.className = 'notice info';
-            noteEl.textContent = 'Atuador aplicado: cpr=' + iCpr.value + ', vel_limit=' + velLim() + ', pos_gain=20, vel_gain=0.16. Clique em "Verificar".';
-            log('atuador: cpr=' + iCpr.value + ' vel_limit=' + velLim());
-          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao aplicar: ' + e.message; log('atuador apply falhou: ' + e.message); }
+            noteEl.textContent = 'Encoder/fuso aplicados (cpr=' + iCpr.value + ', vel_limit=' + velLim() + '). Calibre o encoder e verifique.';
+            log('encoder aplicado, cpr=' + iCpr.value + ' bw=' + iBand.value);
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Falha ao aplicar: ' + e.message; }
+        };
+
+        bCal.onclick = async () => {
+          bCal.disabled = true;
+          try {
+            noteEl.className = 'notice info';
+            noteEl.textContent = 'Calibração do encoder em curso — o eixo gira; mantenha a carga livre.';
+            await odrive.reqState(7); // AXIS_STATE_ENCODER_OFFSET_CALIBRATION (v0.5.6)
+            await pollUntil('current_state', s => parseInt(s) === 1, 60000, 500);
+            const encErr = await getA('encoder.error');
+            const axErr = await getA('error');
+            if ((parseInt(encErr) || 0) !== 0) throw new Error('Erro do encoder: ' + decErr('encoder', encErr));
+            if ((parseInt(axErr) || 0) !== 0) throw new Error('Erro do eixo: ' + decErr('axis', axErr));
+            noteEl.className = 'notice ok';
+            noteEl.textContent = 'Calibração do encoder bem-sucedida. Clique em "Verificar".';
+            log('encoder: calibração ok');
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Calibração do encoder falhou: ' + e.message; }
+          bCal.disabled = false;
+        };
+
+        bIndex.onclick = async () => {
+          try {
+            await odrive.reqState(6); // ENCODER_INDEX_SEARCH
+            await pollUntil('current_state', s => parseInt(s) === 1, 30000, 400);
+            const encErr = await getA('encoder.error');
+            if ((parseInt(encErr) || 0) !== 0) throw new Error('Index não encontrado: ' + decErr('encoder', encErr));
+            log('encoder: índice Z encontrado');
+          } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Busca de índice falhou: ' + e.message; }
         };
 
         bVer.onclick = async () => {
           try {
             const cpr = await getA('encoder.config.cpr');
-            const vl = await getA('controller.config.vel_limit');
-            const pg = await getA('controller.config.pos_gain');
-            const vg = await getA('controller.config.vel_gain');
-            const ok = eq(cpr, iCpr.value, 0.5) && eq(vl, velLim()) && eq(pg, 20) && eq(vg, 0.16);
+            const bw = await getA('encoder.config.bandwidth');
+            const ok = eq(cpr, iCpr.value, 0.5) && eq(bw, iBand.value, 1);
             if (ok) {
-              S.stepOk.actuator = true; S.done.add(id);
+              S.stepOk.encoder = true; S.done.add(id);
               noteEl.className = 'notice ok';
-              noteEl.textContent = '✓ Atuador verificado. Pode avançar.';
-              log('atuador: verificação ok');
+              noteEl.textContent = '✓ Encoder verificado na ODrive (cpr=' + cpr + ', bw=' + bw + '). Pode avançar.';
             } else {
-              S.stepOk.actuator = false;
+              S.stepOk.encoder = false;
               noteEl.className = 'notice warn';
-              noteEl.textContent = 'Verificação FALHOU: cpr=' + cpr + ', vel_limit=' + vl + ', pos_gain=' + fmt(pg, 1) + ', vel_gain=' + fmt(vg, 3);
+              noteEl.textContent = 'Verificação FALHOU: cpr=' + cpr + ' bw=' + bw;
             }
           } catch (e) { noteEl.className = 'notice warn'; noteEl.textContent = 'Erro na verificação: ' + e.message; }
         };
 
         b.append(noteEl,
-                 grid(field('Passo do fuso [mm/volta]', iPitch), field('Curso útil [mm]', iStroke),
-                      field('Sentido', iInv), field('Encoder CPR', iCpr)),
-                 row(bApply, bVer));
+                 grid(field('Modo do encoder', iMode), field('CPR', iCpr), field('Bandwidth [Hz]', iBand)),
+                 grid(field('Índice Z', iIdx), field('Pre-calibrado', iPre)),
+                 grid(field('Passo do fuso [mm/volta]', iPitch), field('Curso útil [mm]', iStroke), field('Sentido', iInv)),
+                 el('h4', null, 'Boot automático'),
+                 grid(field('Calibrar motor no boot', iSuMo), field('Buscar índice Z no boot', iSuIx),
+                      field('Calibrar encoder no boot', iSuEc), field('Malha fechada no boot', iSuCl), field('Homing no boot', iSuHm)),
+                 row(bApply, bCal, bIndex, bVer));
       },
     });
   }
@@ -329,7 +464,7 @@
 
     STEPS.push({
       id,
-      title: '3. Calibração/Homing',
+      title: '4. Calibração/Homing',
       desc: 'Referência de zero do atuador: endstop (fim de curso físico) ou detecção de batente por corrente.',
       canFinish() { return S.stepOk.homing === true; },
       body(b) {
@@ -398,7 +533,7 @@
           noteEl.className = 'notice info';
           noteEl.textContent = 'Executando homing… o atuador vai se mover até a referência.';
           try {
-            await odrive.reqState(6); // HOMING
+            await odrive.reqState(11); // AXIS_STATE_HOMING (v0.5.6)
             await pollUntil('current_state', s => parseInt(s) === 1, 60000, 400);
             const axErr = await getA('error');
             const homed = await getA('is_homed');
@@ -422,7 +557,7 @@
             const hm = await getA('controller.config.homing_mode');
             const homed = await getA('is_homed');
             const axErr = await getA('error');
-            const wantMode = modeSel.value === 'endstop' ? 1 : 2;
+            const wantMode = modeSel.value === 'endstop' ? 0 : 1; // 0=ENDSTOP, 1=STALL_CURRENT
             const ok = eq(hm, wantMode, 0.1) && parseInt(homed) === 1 && (parseInt(axErr) || 1) === 0 && S.stepOk.homing === true;
             if (ok) {
               noteEl.className = 'notice ok';
@@ -454,7 +589,7 @@
 
     STEPS.push({
       id,
-      title: '4. Tuning',
+      title: '5. Tuning',
       desc: 'Ganhos do controlador de posição. Comece conservador; suba só se o movimento ficar lento demais.',
       canFinish() { return S.stepOk.tuning === true; },
       body(b) {
@@ -557,7 +692,7 @@
 
     STEPS.push({
       id,
-      title: '5. Teste de movimento',
+      title: '6. Teste de movimento',
       desc: 'Jog em malha fechada, varredura do curso e acompanhamento ao vivo no gráfico.',
       canFinish() { return S.stepOk.motiontest === true; },
       onLeave() {
@@ -670,7 +805,7 @@
 
     STEPS.push({
       id,
-      title: '6. Salvar & CAN',
+      title: '7. Salvar & CAN',
       desc: 'Grava os parâmetros em flash, configura o barramento CAN e exporta/importa o perfil.',
       canFinish() { return S.stepOk.save === true; },
       body(b) {
@@ -761,10 +896,10 @@
     });
   }
 
-  /* ===================== 7. Monitoramento ===================== */
+  /* ===================== 8. Monitoramento & Terminal ===================== */
   {
     const id = 'monitor';
-    let cv = null, pollTimer = null, drawTimer = null, table = null;
+    let cv = null, pollTimer = null, drawTimer = null, table = null, termIn = null, termOut = null;
 
     function makeTable(axes) {
       const t = el('table', 'list');
@@ -810,7 +945,7 @@
 
     STEPS.push({
       id,
-      title: '7. Monitoramento',
+      title: '8. Monitoramento & Terminal',
       desc: 'Acompanhamento contínuo de todos os eixos do rig. Sem bloqueio de avanço.',
       // sem gating
       body(b) {
@@ -839,7 +974,7 @@
               S.axis = a;
               log('monitor: homing eixo M' + a + '…');
               try {
-                await odrive.reqState(6);
+                await odrive.reqState(11); // HOMING
                 await pollUntil('current_state', s => parseInt(s) === 1, 60000, 400);
                 const err = await getA('error');
                 log('monitor: M' + a + ' fim de homing — ' + decErr('axis', err));
@@ -848,8 +983,38 @@
           } finally { S.axis = prev; }
         };
 
-        b.append(note('Leitura a cada 200 ms. Erros são flags físicas da ODrive (hex).', 'info'),
+        b.append(note('Leitura a cada 200 ms. Erros são flags físicas da ODrive (decodificadas).', 'info'),
                  table, cv, row(bHomeAll));
+
+        // ---- Terminal ASCII integrado (fallback sem Python/odrivetool) ----
+        b.append(el('hr'), el('h3', null, 'Terminal (protocolo ASCII direto)'),
+          note('Comandos na sintaxe ASCII da ODrive, ex.: <code>r vbus_voltage</code> · <code>w axis0.controller.input_pos 1.5</code> · <code>sc</code> (limpa erros). No ESP32 (CAN) o terminal cru não está disponível.', 'info'));
+
+        termOut = el('div', 'log'); termOut.style.maxHeight = '180px';
+        termOut.textContent = '';
+        termIn = el('input'); termIn.type = 'text'; termIn.placeholder = 'ex.: r vbus_voltage'; termIn.style.width = '100%';
+        termIn.style.fontFamily = 'ui-monospace,Consolas,monospace';
+        const bSend = btn('Enviar', 'primary');
+
+        const tlog = (s, cls) => {
+          const t = el('div', null, s);
+          if (cls) t.style.color = cls === 'err' ? 'var(--err)' : (cls === 'rx' ? 'var(--accent2)' : 'var(--txt)');
+          termOut.append(t); termOut.scrollTop = termOut.scrollHeight;
+        };
+        const sendTerm = async () => {
+          const cmd = (termIn.value || '').trim();
+          if (!cmd) return;
+          tlog('> ' + cmd, null);
+          try {
+            const resp = await odrive.raw(cmd);
+            tlog(resp === '' ? '(sem resposta)' : resp, 'rx');
+          } catch (e) { tlog('ERRO: ' + e.message, 'err'); }
+          termIn.value = ''; termIn.focus();
+        };
+        bSend.onclick = sendTerm;
+        termIn.onkeydown = e => { if (e.key === 'Enter') sendTerm(); };
+
+        b.append(grid(field('Comando', termIn)), row(bSend), termOut);
       },
       onLeave() {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }

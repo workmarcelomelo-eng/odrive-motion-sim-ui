@@ -60,6 +60,12 @@ class WSTransport {
   action(name)      { return this.call('action', { action: name }); }
   subscribe(period) { return this.call('telemetry', { on: true, period_ms: period }); }
   unsubscribe()     { return this.call('telemetry', { on: false }); }
+  raw(line) { // comando ASCII cru via WS — só se a bridge/mock expuser; na ponte ESP32 CAN não existe terminal cru
+    const host = location.hostname;
+    if (host === 'odrive-motorsim' || host.endsWith('.local') || (/^\d+\.\d+\.\d+\.\d+$/.test(host) && host !== '127.0.0.1'))
+      return Promise.reject(new Error('Terminal ASCII não disponível pela ponte ESP32 (CAN) — use get/set nas etapas ou conecte por USB serial'));
+    return this.call('raw', { line });
+  }
 }
 /* Transporte serial direto à ODrive (protocolo ASCII, ver docs/ascii-protocol.rst).
  * No Windows: rookEdge/Chrome com Web Serial; abre o COM da ODrive (USB) ou um adaptador
@@ -90,6 +96,7 @@ class WebSerialTransport {
           const line = this._buf.slice(0, i).replace(/\r$/, '').trim();
           this._buf = this._buf.slice(i + 1);
           if (this._pendingGet) { const p = this._pendingGet; this._pendingGet = null; const f = parseFloat(line); p.res(isNaN(f) ? line : f); }
+          else if (this._rawSink) this._rawSink(line);
         }
       }
     } catch (e) {} this._close();
@@ -136,6 +143,16 @@ class WebSerialTransport {
   action(name) {
     const m = { save: 'ss', erase: 'se', reboot: 'sr', clear: 'sc' };
     return this._q(async () => { this._send(m[name] || name); await new Promise(r => setTimeout(r, 50)); });
+  }
+  // Terminal ASCII cru: envia a linha e coleta respostas por 400 ms.
+  raw(line) {
+    if (!this.connected) return Promise.reject(new Error('não conectado'));
+    return this._q(() => new Promise((res) => {
+      const lines = [];
+      this._rawSink = l => lines.push(l);
+      this._send(line);
+      setTimeout(() => { this._rawSink = null; res(lines.join('\n')); }, 400);
+    }));
   }
   scan() { return Promise.resolve([{ serial: 'USB-serial', hw_major: 3, hw_minor: 6, fw: '0.5.6-sh' }]); }
   // Sincroniza campos do wizard a partir da placa (chamada automática na (re)conexão)
@@ -345,6 +362,50 @@ const STEPS = [];
         };
         b.append(row(bConn, bScan), table, row(bUse), el('hr'), row(bWipe),
           note('O botão de apagar só serve se houver configuração antiga travada — use com cautela.', 'warn'));
+
+        // ===== Controles gerais (disponíveis após a conexão) =====
+        const bIdle = btn('⏹ Idle');
+        const bReboot2 = btn('↻ Reboot');
+        const bSaveCfg = btn('💾 Salvar configurações');
+        const bShowErr = btn('🔍 Ver erros');
+        const bClearErr = btn('✖ Limpar erros');
+        const bBackup = btn('⤓ Backup de configuração');
+
+        bIdle.onclick = async () => { try { await odrive.reqState(1); log('Idle solicitado'); } catch (e) { log('idle falhou: ' + e.message); } };
+        bReboot2.onclick = async () => { try { await odrive.action('reboot'); log('reboot enviado'); } catch (e) { log('reboot falhou: ' + e.message); } };
+        bSaveCfg.onclick = async () => {
+          if (!confirm('Salvar toda a configuração em flash na ODrive?')) return;
+          try { await odrive.action('save'); log('configuração salva (flash)'); } catch (e) { log('save falhou: ' + e.message); }
+        };
+        bShowErr.onclick = async () => {
+          try {
+            const ax = await getA('error'); const mo = await getA('motor.error'); const enc = await getA('encoder.error');
+            log('Erros do eixo:\n' + decErr('axis', ax) + '\nMotor: ' + decErr('motor', mo) + '\nEncoder: ' + decErr('encoder', enc));
+          } catch (e) { log('leitura de erros falhou: ' + e.message); }
+        };
+        bClearErr.onclick = async () => { try { await odrive.action('clear'); log('erros limpos'); } catch (e) { log('clear falhou: ' + e.message); } };
+        bBackup.onclick = async () => {
+          try {
+            const keys = ['vbus_voltage', 'serial_number', 'fw_version_major', 'fw_version_minor',
+              'axis' + S.axis + '.motor.config.motor_type', 'axis' + S.axis + '.motor.config.pole_pairs',
+              'axis' + S.axis + '.motor.config.torque_constant', 'axis' + S.axis + '.motor.config.current_lim',
+              'axis' + S.axis + '.motor.config.calibration_current', 'axis' + S.axis + '.motor.config.resistance_calib_max_voltage',
+              'axis' + S.axis + '.encoder.config.cpr', 'axis' + S.axis + '.encoder.config.bandwidth',
+              'axis' + S.axis + '.encoder.config.use_index', 'axis' + S.axis + '.encoder.config.pre_calibrated',
+              'axis' + S.axis + '.controller.config.pos_gain', 'axis' + S.axis + '.controller.config.vel_gain',
+              'axis' + S.axis + '.controller.config.vel_integrator_gain', 'axis' + S.axis + '.controller.config.control_mode',
+              'axis' + S.axis + '.controller.config.homing_mode', 'axis' + S.axis + '.config.can.node_id',
+              'axis' + S.axis + '.config.can.baud_rate'];
+            const snap = { exported_at: new Date().toISOString(), axis: S.axis, values: {} };
+            for (const p of keys) { try { snap.values[p] = await odrive.get(p); await new Promise(r => setTimeout(r, 40)); } catch (e) { snap.values[p] = 'ERR:' + e.message; } }
+            const blob = new Blob([JSON.stringify(snap, null, 2)], { type: 'application/json' });
+            const a = el('a'); a.href = URL.createObjectURL(blob); a.download = `odrive_backup_${Date.now()}.json`; a.click();
+            log('backup exportado (' + keys.length + ' chaves)');
+          } catch (e) { log('backup falhou: ' + e.message); }
+        };
+
+        b.append(el('h4', null, 'Controles gerais'),
+                 grid(row(bIdle, bReboot2), row(bSaveCfg, bShowErr), row(bClearErr, bBackup)));
       }
     },
   });
